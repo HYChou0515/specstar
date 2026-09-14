@@ -146,4 +146,5 @@ python -c 'from myapp import spec; print(spec.load(open("backup.acbak", "rb")))'
 - 原本整個 model section 先 buffer 再一次 `load_records_bulk()`,實測峰值 ≈ **2.3×** section bytes;改成每 N 筆 / M bytes flush,100 筆一批實測 **0.25×**。
 - `load_records_bulk(..., skipped_ids=)` 讓 `on_duplicate=skip` 的「被 skip 的 resource 其 revision 也要 skip」跨批次成立(`test_skip_holds_across_flush_boundaries` 用 `batch_size=1` 逼出邊界)。
 - `/_backup/import`、`/{model}/import` 改餵 `UploadFile.file`(spooled temp file),不再 `read()` 整包;raw body 路徑本質上仍是整包。
+- 目標端 pg+pg(owner 告知的實際目標):`tests/test_postgres_legacy_load.py` 對 live Postgres 16 跑 `PostgresStorageFactory` full / full+delta,全綠;走 `test_postgres_*` glob 自動標 integration。`PostgresStorageFactory` 的 `encoding=msgpack` 預設只管 store 自己的 meta/info row,payload encoding 跟 `SpecStar(encoding=)`(json)走,與 0.4.6 `dump()` 預設一致。
 - 沒做:0.4.6 的 `GET /_backup/export` HTTP route(搬家是 owner 跑一次腳本,不需要對外開全量匯出口;0.4.x 預設 `AllowAll`)、0.4.6 per-model `dump(models=...)`。

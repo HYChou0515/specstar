@@ -225,10 +225,18 @@ should export. Two are exercised by tests against the real 0.4.6 package:
   setup behind #448. The delta query (`updated_time_start=`) runs as SQL
   on the SQLite side; the archive it produces is identical in shape.
 
-Other hand-composed backends (`PostgresMetaStore`, `RedisMetaStore`,
+Other hand-composed 0.4.x backends (`PostgresMetaStore`, `RedisMetaStore`,
 `S3ResourceStore`) are untested — please
 [open an issue](https://github.com/HYChou0515/specstar/issues) with the
 combination if you hit a problem.
+
+On the **specstar side** the archive is backend-agnostic; the import is
+tested into memory, disk, SQLite-meta and a live `PostgresStorageFactory`
+(Postgres meta + Postgres revisions, `tests/test_postgres_legacy_load.py`).
+`PostgresStorageFactory` defaults its *store* encoding to msgpack — that
+governs how it serialises its own meta / info rows and is independent of
+the payload encoding, which follows `SpecStar(encoding=...)` (JSON by
+default, matching `crud.dump()`'s default).
 
 ## Not covered
 - **0.5 – 0.8.2 tar archives**: those versions had a working tar-based
