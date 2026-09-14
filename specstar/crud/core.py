@@ -3358,9 +3358,12 @@ class SpecStar:
                     ),
                 )
 
-            data = await file.read()
+            # Stream from the upload's spooled temp file: load() reads
+            # frame by frame and writes in batches, so a large archive never
+            # has to fit in memory here.
+            await file.seek(0)
             try:
-                stats = specstar_ref.load(_io.BytesIO(data), on_duplicate=strategy)
+                stats = specstar_ref.load(file.file, on_duplicate=strategy)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
@@ -3591,13 +3594,28 @@ class SpecStar:
         self,
         bio: IO[bytes],
         on_duplicate: "OnDuplicate | None" = None,
+        *,
+        batch_size: int = 1000,
+        batch_bytes: int = 64 * 1024 * 1024,
     ) -> dict[str, "LoadStats"]:
         """Import resources from a streaming msgpack archive.
+
+        Records are written in batches as they are read — every
+        ``batch_size`` records or ``batch_bytes`` of record payload,
+        whichever comes first — so peak memory is set by the batch, not by
+        the largest model section in the archive. ``bio`` only needs
+        ``read(n)``: a plain file, a ``gzip.open(...)`` handle or an
+        upload's spooled temp file all stream.
 
         Args:
             bio: Binary I/O stream to read from.
             on_duplicate: Strategy for duplicate resource IDs.
-                Defaults to ``OnDuplicate.overwrite``.
+                Defaults to ``OnDuplicate.overwrite``. With ``skip``, a
+                resource that already exists is left untouched *including*
+                its revisions, even when those arrive in a later batch.
+            batch_size: Records per write batch.
+            batch_bytes: Payload bytes per write batch (blob-heavy archives
+                hit this bound first).
 
         Returns:
             Per-model load statistics: ``{model_name: LoadStats}``.
@@ -3633,10 +3651,47 @@ class SpecStar:
 
         current_model: str | None = None
         current_mgr = None
-        # Per-model record buffers for bulk load
+        # Record buffers for the batch being assembled, and the ids skipped
+        # so far in this model section (a skipped resource's revisions may
+        # arrive in a later batch and must be skipped too).
         meta_buf: list[MetaRecord] = []
         rev_buf: list[RevisionRecord] = []
         blob_buf: list[BlobRecord] = []
+        buffered_bytes = 0
+        skipped_ids: set[str] = set()
+
+        def flush() -> None:
+            nonlocal buffered_bytes
+            if current_mgr is None or current_model is None:
+                return
+            if meta_buf or rev_buf or blob_buf:
+                st = current_mgr.load_records_bulk(
+                    meta_buf,
+                    rev_buf,
+                    blob_buf,
+                    on_duplicate=on_duplicate,
+                    skipped_ids=skipped_ids,
+                )
+                s = stats[current_model]
+                s.loaded += st.loaded
+                s.skipped += st.skipped
+                s.total += st.total
+            meta_buf.clear()
+            rev_buf.clear()
+            blob_buf.clear()
+            buffered_bytes = 0
+
+        def buffer(buf: list, record, size: int) -> None:
+            nonlocal buffered_bytes
+            if current_mgr is None:
+                raise ValueError(f"{type(record).__name__} outside of model section.")
+            buf.append(record)
+            buffered_bytes += size
+            if (
+                len(meta_buf) + len(rev_buf) + len(blob_buf) >= batch_size
+                or buffered_bytes >= batch_bytes
+            ):
+                flush()
 
         for record in reader:
             if isinstance(record, ModelStartRecord):
@@ -3646,45 +3701,23 @@ class SpecStar:
                         f"Model '{current_model}' not found in resource managers."
                     )
                 current_mgr = self.resource_managers[current_model]
-                meta_buf.clear()
-                rev_buf.clear()
-                blob_buf.clear()
+                skipped_ids = set()
                 if current_model not in stats:
                     stats[current_model] = LoadStats()
 
             elif isinstance(record, ModelEndRecord):
-                # Flush buffered records via bulk load
-                if current_mgr is not None and current_model is not None:
-                    st = current_mgr.load_records_bulk(
-                        meta_buf,
-                        rev_buf,
-                        blob_buf,
-                        on_duplicate=on_duplicate,
-                    )
-                    s = stats[current_model]
-                    s.loaded += st.loaded
-                    s.skipped += st.skipped
-                    s.total += st.total
+                flush()
                 current_model = None
                 current_mgr = None
-                meta_buf.clear()
-                rev_buf.clear()
-                blob_buf.clear()
 
             elif isinstance(record, MetaRecord):
-                if current_mgr is None:
-                    raise ValueError("MetaRecord outside of model section.")
-                meta_buf.append(record)
+                buffer(meta_buf, record, len(record.data))
 
             elif isinstance(record, RevisionRecord):
-                if current_mgr is None:
-                    raise ValueError("RevisionRecord outside of model section.")
-                rev_buf.append(record)
+                buffer(rev_buf, record, len(record.data))
 
             elif isinstance(record, BlobRecord):
-                if current_mgr is None:
-                    raise ValueError("BlobRecord outside of model section.")
-                blob_buf.append(record)
+                buffer(blob_buf, record, len(record.blob_data))
 
             elif isinstance(record, EofRecord):
                 break

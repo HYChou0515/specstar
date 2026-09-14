@@ -11,7 +11,7 @@ Two templates are provided:
 
 import io
 import textwrap
-from typing import TypeVar
+from typing import IO, TypeVar
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
@@ -206,8 +206,18 @@ class ImportRouteTemplate(BaseRouteTemplate):
             # --- read & validate archive ------------------------------
             # Accept either a multipart ``file`` field or a raw request body so
             # the bytes from ``GET /{model}/export`` can be POSTed back directly.
-            data = await file.read() if file is not None else await request.body()
-            if not data:
+            # A multipart upload is streamed from its spooled temp file; a raw
+            # body is necessarily buffered whole.
+            if file is not None:
+                await file.seek(0)
+                stream: IO[bytes] = file.file
+            else:
+                stream = io.BytesIO(await request.body())
+            reader = DumpStreamReader(stream)
+
+            try:
+                first = next(reader)
+            except StopIteration:
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -215,12 +225,6 @@ class ImportRouteTemplate(BaseRouteTemplate):
                         "field or as a raw application/octet-stream body."
                     ),
                 )
-            reader = DumpStreamReader(io.BytesIO(data))
-
-            try:
-                first = next(reader)
-            except StopIteration:
-                raise HTTPException(status_code=400, detail="Empty archive.")
             if not isinstance(first, HeaderRecord):
                 raise HTTPException(
                     status_code=400,

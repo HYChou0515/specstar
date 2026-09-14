@@ -4321,7 +4321,9 @@ class ResourceManager(IResourceManager[T], Generic[T]):
         # One read for all of them: resolving the schema version and reading the
         # info per revision made pruning cost statements proportional to the
         # revision count — the thing being pruned.
-        infos: dict[str, RevisionInfo] = self.storage.get_all_revision_infos(resource_id)
+        infos: dict[str, RevisionInfo] = self.storage.get_all_revision_infos(
+            resource_id
+        )
         if len(infos) <= 1:
             return []
 
@@ -4673,6 +4675,8 @@ class ResourceManager(IResourceManager[T], Generic[T]):
         revision_records: "list[RevisionRecord]",
         blob_records: "list[BlobRecord]",
         on_duplicate: "OnDuplicate" = OnDuplicate.raise_error,
+        *,
+        skipped_ids: "set[str] | None" = None,
     ):
         """Batch-load multiple dump records into storage.
 
@@ -4690,6 +4694,14 @@ class ResourceManager(IResourceManager[T], Generic[T]):
 
         Events (Before/After/OnSuccess/OnFailure Load) are fired **once
         per batch**, not per record.
+
+        Args:
+            skipped_ids: Resource ids already skipped by earlier batches of
+                the same archive section. Their revisions in this batch are
+                dropped, and ids skipped here are added to the set, so a
+                caller that splits one section over several calls keeps the
+                ``OnDuplicate.skip`` contract intact. ``None`` (the default)
+                scopes the set to this call.
 
         Returns:
             A :class:`LoadStats` instance with *loaded*, *skipped* and
@@ -4711,7 +4723,8 @@ class ResourceManager(IResourceManager[T], Generic[T]):
         try:
             # --- 1. decode + deduplicate metas ----------------------------
             metas_to_save: list[ResourceMeta] = []
-            skipped_ids: set[str] = set()
+            if skipped_ids is None:
+                skipped_ids = set()
 
             for rec in meta_records:
                 meta = self.meta_serializer.decode(rec.data)
