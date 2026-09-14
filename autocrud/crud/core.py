@@ -63,6 +63,7 @@ from autocrud.types import (
     IResourceManager,
     IndexableField,
     ResourceMeta,
+    ResourceMetaSearchQuery,
     RevisionInfo,
 )
 from autocrud.util.naming import NameConverter
@@ -501,7 +502,13 @@ class AutoCRUD:
                     pass
         return router
 
-    def dump(self, bio: IO[bytes], *, encoding: Encoding | str = Encoding.json) -> None:
+    def dump(
+        self,
+        bio: IO[bytes],
+        *,
+        encoding: Encoding | str = Encoding.json,
+        query: ResourceMetaSearchQuery | None = None,
+    ) -> None:
         """Export every model's resources as a specstar ``.acbak`` archive.
 
         The stream is the ``specstar`` v2 backup format (see
@@ -517,11 +524,20 @@ class AutoCRUD:
                 the encoding the *importing* side stores data in (specstar
                 defaults to JSON). ``data_hash`` is recomputed over the
                 emitted bytes, so it stays consistent either way.
+            query: Optional ``ResourceMetaSearchQuery`` applied to every
+                model. Selects *resources* (e.g. ``updated_time_start=`` for
+                "touched since"); each hit is exported with its complete
+                revision history. ``limit`` / ``offset`` are ignored.
 
         Example:
             ```python
             with open("backup.acbak", "wb") as f:
                 autocrud.dump(f)
+
+            # Incremental: only resources touched since the full export began.
+            # updated_time moves on update / patch / switch / delete / restore.
+            with open("delta.acbak", "wb") as f:
+                autocrud.dump(f, query=ResourceMetaSearchQuery(updated_time_start=t0))
             ```
 
         Notes:
@@ -536,7 +552,7 @@ class AutoCRUD:
         writer.write(HeaderRecord())
         for model_name, mgr in self.resource_managers.items():
             writer.write(ModelStartRecord(model_name=model_name))
-            for record in mgr.dump(encoding=Encoding(encoding)):
+            for record in mgr.dump(encoding=Encoding(encoding), query=query):
                 writer.write(record)
             writer.write(ModelEndRecord(model_name=model_name))
         writer.write(EofRecord())

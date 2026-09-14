@@ -11,7 +11,11 @@ from xxhash import xxh3_128_hexdigest
 from autocrud.crud.core import AutoCRUD
 from autocrud.resource_manager.dump_format import DumpStreamReader
 from autocrud.resource_manager.storage_factory import DiskStorageFactory
-from autocrud.types import RawResource, ResourceIsDeletedError
+from autocrud.types import (
+    RawResource,
+    ResourceIsDeletedError,
+    ResourceMetaSearchQuery,
+)
 
 
 class User(Struct):
@@ -225,3 +229,77 @@ def test_load_rejects_a_stream_that_is_not_an_archive(tmp_path):
         crud.load(io.BytesIO(b""))
     with pytest.raises(ValueError, match="missing header record"):
         crud.load(io.BytesIO(b"\x00\x00\x00\x01\x90"))  # a valid frame, wrong record
+
+
+def _section_ids(raw: bytes) -> dict[str, list[str]]:
+    """{resource_id: [revision_id, ...]} for every MetaRecord in the archive."""
+    out: dict[str, list[str]] = {}
+    for rec in _records(raw):
+        if type(rec).__name__ == "MetaRecord":
+            meta = msgspec.msgpack.decode(rec.data, type=SpecstarResourceMeta)
+            out[meta.resource_id] = []
+        elif type(rec).__name__ == "RevisionRecord":
+            raw_res = msgspec.msgpack.decode(rec.data, type=RawResource)
+            out[raw_res.info.resource_id].append(raw_res.info.revision_id)
+    return out
+
+
+def test_dump_query_exports_only_resources_touched_since_with_full_history(tmp_path):
+    src = _disk_crud(tmp_path / "src", User)
+    users = src.get_resource_manager(User)
+    cutoff = T0 + dt.timedelta(days=1)
+    before, after = T0, cutoff + dt.timedelta(hours=1)
+
+    with users.meta_provide("alice", before):
+        untouched = users.create(User(name="old", age=1))
+        updated = users.create(User(name="u1", age=1))
+        switched = users.create(User(name="s1", age=1))
+        deleted = users.create(User(name="d", age=1))
+    with users.meta_provide("alice", before + dt.timedelta(minutes=1)):
+        sw2 = users.update(switched.resource_id, User(name="s2", age=2))
+    with users.meta_provide("bob", after):
+        users.update(
+            updated.resource_id, User(name="u2", age=2)
+        )  # updated after cutoff
+        users.switch(
+            switched.resource_id, switched.revision_id
+        )  # switched after cutoff
+        users.delete(deleted.resource_id)  # soft-deleted after cutoff
+        created = users.create(User(name="new", age=1))  # created after cutoff
+
+    bio = io.BytesIO()
+    src.dump(bio, query=ResourceMetaSearchQuery(updated_time_start=cutoff))
+    exported = _section_ids(bio.getvalue())
+
+    assert untouched.resource_id not in exported
+    assert set(exported) == {
+        updated.resource_id,
+        switched.resource_id,
+        deleted.resource_id,
+        created.resource_id,
+    }
+    # a hit resource brings *all* of its revisions, not just the recent ones
+    assert set(exported[switched.resource_id]) == {
+        switched.revision_id,
+        sw2.revision_id,
+    }
+    assert len(exported[updated.resource_id]) == 2
+
+    # importing the delta over a full import leaves the target equal to the source
+    dst = _disk_crud(tmp_path / "dst", User)
+    dst.load(io.BytesIO(bio.getvalue()))
+    got = dst.get_resource_manager(User)
+    assert got.get(switched.resource_id).data == User(name="s1", age=1)
+    assert got.get_meta(switched.resource_id).total_revision_count == 2
+    assert got.storage.get_meta(deleted.resource_id).is_deleted is True
+
+
+def test_dump_query_ignores_the_default_page_size(tmp_path):
+    src = _disk_crud(tmp_path / "src", User)
+    users = src.get_resource_manager(User)
+    with users.meta_provide("alice", T0):
+        for i in range(25):  # > ResourceMetaSearchQuery.limit default of 10
+            users.create(User(name=f"u{i}", age=i))
+    bio = io.BytesIO()
+    src.dump(bio, query=ResourceMetaSearchQuery(created_time_start=T0))
+    assert len(_section_ids(bio.getvalue())) == 25

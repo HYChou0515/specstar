@@ -694,17 +694,38 @@ class ResourceManager(IResourceManager[T], Generic[T]):
     @execute_with_events(
         (BeforeDump, AfterDump, OnSuccessDump, OnFailureDump),
         "result",
-        inputs={"encoding": UNSET},
+        inputs={"encoding": UNSET, "query": UNSET},
     )
     def dump(
-        self, *, encoding: Encoding = Encoding.json
+        self,
+        *,
+        encoding: Encoding = Encoding.json,
+        query: ResourceMetaSearchQuery | None = None,
     ) -> Generator[MetaRecord | RevisionRecord]:
         payload_encoder = MsgspecSerializer(
             encoding=encoding, resource_type=self.resource_type
         )
-        for meta in self.storage.dump_meta():
+        if query is None:
+            metas = self.storage.dump_meta()
+            resources = self.storage.dump_resource()
+        else:
+            # A query selects *resources*; each hit is exported with its whole
+            # revision history so the meta and the history stay consistent
+            # (and re-importing it over an earlier full import is idempotent).
+            # limit/offset are paging concerns of the search API, not of an
+            # export, so they are overridden.
+            hits = self.storage.search(
+                msgspec.structs.replace(query, limit=2**31 - 1, offset=0)
+            )
+            metas = iter(hits)
+            resources = (
+                self.storage.get_resource_revision(meta.resource_id, revision_id)
+                for meta in hits
+                for revision_id in self.storage.list_revisions(meta.resource_id)
+            )
+        for meta in metas:
             yield MetaRecord(data=self.meta_serializer.encode(self._export_meta(meta)))
-        for resource in self.storage.dump_resource():
+        for resource in resources:
             raw_data = payload_encoder.encode(resource.data)
             info = resource.info
             # The hash is defined over the stored bytes; re-deriving it keeps it
