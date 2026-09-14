@@ -13,6 +13,7 @@ Use these pages when you are moving beyond the first demo and want to design a m
 - [Storage](/specstar/guides/storage) — compare storage factories and understand persistence trade-offs
 - [Performance](/specstar/guides/performance) — understand trade-offs, bottlenecks, and scaling considerations
 - [From demo to production](/specstar/guides/from-demo-to-production) — move from a local prototype to a deployable service
+- [Upgrading from autocrud 0.4.x](/specstar/guides/upgrade-from-0.4) — export with `autocrud==0.4.6`, import with `SpecStar.load()`; no data left behind
 - [Upgrading to 0.11](/specstar/guides/upgrade-0.11) — spec-driven authoring layer (additive, no breaking changes)
 - [Upgrading to 0.10](/specstar/guides/upgrade-0.10)
 - [Upgrading to 0.9](/specstar/guides/upgrade-0.9) — breaking changes and migration steps from 0.8.5

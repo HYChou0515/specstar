@@ -1,0 +1,215 @@
+{
+  "note": {
+    "note:1": {
+      "created_by": "dave",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "note:1:1",
+      "indexed_data": {},
+      "is_deleted": false,
+      "revisions": {
+        "note:1:1": {
+          "created_by": "dave",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "body": "hello",
+            "count": 1
+          },
+          "data_hash": "xxh3_128:dfcc127f3abb91df195785fd8ecf1f3b",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "a4dc348f-60dc-4f8d-b671-e34c985f32fc"
+        }
+      },
+      "total_revision_count": 1,
+      "updated_by": "dave",
+      "updated_time": "2025-09-01T12:00:00"
+    },
+    "note:2": {
+      "created_by": "dave",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "note:2:1",
+      "indexed_data": {},
+      "is_deleted": false,
+      "revisions": {
+        "note:2:1": {
+          "created_by": "dave",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "body": "世界",
+            "count": 2
+          },
+          "data_hash": "xxh3_128:ba4e7813836c58ce3ad7043f3d0b1051",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "a7f3fd1d-81b7-4fcd-882f-ef47c22d7825"
+        }
+      },
+      "total_revision_count": 1,
+      "updated_by": "dave",
+      "updated_time": "2025-09-01T12:00:00"
+    }
+  },
+  "ticket": {
+    "ticket:1": {
+      "created_by": "alice",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "ticket:1:3",
+      "indexed_data": {
+        "priority": "low",
+        "title": "A third"
+      },
+      "is_deleted": false,
+      "revisions": {
+        "ticket:1:1": {
+          "created_by": "alice",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "address": {
+              "city": "Taipei",
+              "zip": "100"
+            },
+            "due": "2025-10-01T08:30:00",
+            "payload": "AAECYmluYXJ5",
+            "priority": "low",
+            "ref": "12345678-1234-5678-1234-567812345678",
+            "score": 1.5,
+            "tags": [
+              "x"
+            ],
+            "title": "A first"
+          },
+          "data_hash": "xxh3_128:7b095295ca5e9d871b25ba4a72b09e49",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "b6404fa8-756d-464c-8014-2096c8d3a6f9"
+        },
+        "ticket:1:2": {
+          "created_by": "bob",
+          "created_time": "2025-09-01T13:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "high",
+            "ref": null,
+            "score": 0.0,
+            "tags": [
+              "x",
+              "y"
+            ],
+            "title": "A second"
+          },
+          "data_hash": "xxh3_128:c59e5c3c6225d83dd4ab4526e61d8b4a",
+          "parent_revision_id": "ticket:1:1",
+          "status": "stable",
+          "uid": "959ab294-8a19-416c-bc7d-62add8036107"
+        },
+        "ticket:1:3": {
+          "created_by": "bob",
+          "created_time": "2025-09-01T14:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": -2.25,
+            "tags": [],
+            "title": "A third"
+          },
+          "data_hash": "xxh3_128:06d25a073111638e0be834cab0d24b55",
+          "parent_revision_id": "ticket:1:2",
+          "status": "stable",
+          "uid": "0383f66a-2be2-45f6-986b-57918264a5fa"
+        }
+      },
+      "total_revision_count": 3,
+      "updated_by": "bob",
+      "updated_time": "2025-09-01T14:00:00"
+    },
+    "ticket:2": {
+      "created_by": "alice",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "ticket:2:1",
+      "indexed_data": {
+        "priority": "low",
+        "title": "B gone"
+      },
+      "is_deleted": true,
+      "revisions": {
+        "ticket:2:1": {
+          "created_by": "alice",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": 0.0,
+            "tags": [],
+            "title": "B gone"
+          },
+          "data_hash": "xxh3_128:896d8bd1ddce16ae79ddca1279d1716d",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "bbfce4ec-e770-44b1-9692-ff16cb477ead"
+        }
+      },
+      "total_revision_count": 1,
+      "updated_by": "carol",
+      "updated_time": "2025-09-02T12:00:00"
+    },
+    "ticket:3": {
+      "created_by": "alice",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "ticket:3:1",
+      "indexed_data": {
+        "priority": "low",
+        "title": "C v1"
+      },
+      "is_deleted": false,
+      "revisions": {
+        "ticket:3:1": {
+          "created_by": "alice",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": 0.0,
+            "tags": [],
+            "title": "C v1"
+          },
+          "data_hash": "xxh3_128:073148cd94d2388a0fff844571036a4e",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "ffee3601-3744-43bc-bd0c-6ab2885011e3"
+        },
+        "ticket:3:2": {
+          "created_by": "alice",
+          "created_time": "2025-09-01T12:05:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": 0.0,
+            "tags": [],
+            "title": "C v2"
+          },
+          "data_hash": "xxh3_128:a26cfddc09067b20bd3fcb8b21071b81",
+          "parent_revision_id": "ticket:3:1",
+          "status": "stable",
+          "uid": "4a6ade12-9cf9-4b2a-b69b-e42b1f779de0"
+        }
+      },
+      "total_revision_count": 2,
+      "updated_by": "alice",
+      "updated_time": "2025-09-01T12:10:00"
+    }
+  }
+}

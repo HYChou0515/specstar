@@ -6,6 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
+## [Unreleased]
+
+
+### Added
+
+- Data migration path from `autocrud` 0.4.x (#448): `autocrud==0.4.6` is a
+  patch of the old line whose `AutoCRUD.dump()` — broken on 0.4.0–0.4.5 —
+  now writes the current `.acbak` v2 archive, which `SpecStar.load()`
+  imports unchanged (revision history, soft-deletes, `switch()`-ed
+  currents, `indexed_data`, and pre-filled `rev_*` mirror fields). Pinned
+  by a fixture generated with the real 0.4.6 package
+  (`tests/test_legacy_load.py`).
+
+
+### Documentation
+
+- New guide *Upgrading from autocrud 0.4.x*; `MIGRATION.md` §8 now points
+  0.4 users there instead of at the schema-migration page.
+
 ## [0.13.0a3] — 2026-07-28
 
 
