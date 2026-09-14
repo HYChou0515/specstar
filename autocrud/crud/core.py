@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import io
-import tarfile
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import IO, Literal, TypeVar
 import logging
+
+import msgspec
 from fastapi import APIRouter, FastAPI
 from fastapi.openapi.utils import get_openapi
 
@@ -38,9 +38,20 @@ from autocrud.crud.route_templates.update import UpdateRouteTemplate
 from autocrud.permission.rbac import RBACPermissionChecker
 from autocrud.permission.simple import AllowAll
 from autocrud.resource_manager.basic import (
+    Encoding,
     IStorage,
 )
 from autocrud.resource_manager.core import ResourceManager
+from autocrud.resource_manager.dump_format import (
+    DumpStreamReader,
+    DumpStreamWriter,
+    EofRecord,
+    HeaderRecord,
+    MetaRecord,
+    ModelEndRecord,
+    ModelStartRecord,
+    RevisionRecord,
+)
 from autocrud.resource_manager.storage_factory import (
     IStorageFactory,
     MemoryStorageFactory,
@@ -490,146 +501,85 @@ class AutoCRUD:
                     pass
         return router
 
-    def dump(self, bio: IO[bytes]) -> None:
-        """Export all resources and their data to a tar archive for backup or migration.
+    def dump(self, bio: IO[bytes], *, encoding: Encoding | str = Encoding.json) -> None:
+        """Export every model's resources as a specstar ``.acbak`` archive.
 
-        This method creates a complete backup of all resources managed by AutoCRUD,
-        including all data, metadata, and revision history. The output is a tar
-        archive that can be used for backup, migration, or data transfer purposes.
+        The stream is the ``specstar`` v2 backup format (see
+        :mod:`autocrud.resource_manager.dump_format`), so the same file can be
+        restored here with :meth:`load` **or** imported into a ``specstar``
+        deployment with ``SpecStar.load()`` — this is the supported path for
+        migrating a 0.4.x installation to ``specstar``.
 
         Args:
-            bio: A binary I/O stream to write the tar archive to.
+            bio: Binary stream to write to.
+            encoding: Encoding of each revision's payload bytes inside the
+                archive — ``"json"`` (default) or ``"msgpack"``. Match it to
+                the encoding the *importing* side stores data in (specstar
+                defaults to JSON). ``data_hash`` is recomputed over the
+                emitted bytes, so it stays consistent either way.
 
         Example:
             ```python
-            # Backup to file
-            with open("backup.tar", "wb") as f:
+            with open("backup.acbak", "wb") as f:
                 autocrud.dump(f)
-
-            # Backup to memory buffer
-            import io
-
-            buffer = io.BytesIO()
-            autocrud.dump(buffer)
-            backup_data = buffer.getvalue()
-
-            # Upload to cloud storage
-            import boto3
-
-            s3 = boto3.client("s3")
-            with io.BytesIO() as buffer:
-                autocrud.dump(buffer)
-                buffer.seek(0)
-                s3.upload_fileobj(buffer, "backup-bucket", "autocrud-backup.tar")
             ```
 
-        Archive Structure:
-            The tar archive contains:
-            - One directory per model (e.g., "users/", "posts/")
-            - Within each directory, files containing resource data
-            - All metadata, revision history, and relationships preserved
-            - Compatible with the load() method for restoration
-
-        Use Cases:
-            - Regular backups of your data
-            - Migrating between environments
-            - Data archival and compliance
-            - Disaster recovery preparations
-            - Development data seeding
-
-        Note:
-            - The archive includes ALL resources, including soft-deleted ones
-            - Large datasets may result in large archive files
-            - Consider streaming to avoid memory issues with large datasets
-            - The archive format is compatible across AutoCRUD versions
+        Notes:
+            - Every resource is included, soft-deleted ones too, with its
+              complete revision history.
+            - Revisions are read through the normal store path, so with a
+              ``migration=`` configured, older-schema revisions are migrated
+              (and rewritten on disk) exactly as a plain ``get()`` would.
+              Back the data directory up first.
         """
-        with tarfile.open(fileobj=bio, mode="w|") as tar:
-            for model_name, mgr in self.resource_managers.items():
-                for key, value in mgr.dump():
-                    data = io.BytesIO(value)
-                    tarinfo = tarfile.TarInfo(name=f"{model_name}/{key}")
-                    tarinfo.size = len(value)
-                    tar.addfile(tarinfo, fileobj=data)
+        writer = DumpStreamWriter(bio)
+        writer.write(HeaderRecord())
+        for model_name, mgr in self.resource_managers.items():
+            writer.write(ModelStartRecord(model_name=model_name))
+            for record in mgr.dump(encoding=Encoding(encoding)):
+                writer.write(record)
+            writer.write(ModelEndRecord(model_name=model_name))
+        writer.write(EofRecord())
 
     def load(self, bio: IO[bytes]) -> None:
-        """Import resources from a tar archive created by the dump() method.
+        """Import resources from an archive written by :meth:`dump`.
 
-        This method restores resources from a backup archive, recreating all
-        data, metadata, and revision history. It's the complement to dump()
-        and enables complete data restoration and migration scenarios.
+        Every model in the archive must already be registered with
+        :meth:`add_model`. Resources with the same ID are overwritten.
 
         Args:
-            bio: A binary I/O stream containing the tar archive to load from.
+            bio: Binary stream to read from.
 
-        Example:
-            ```python
-            # Restore from file backup
-            with open("backup.tar", "rb") as f:
-                autocrud.load(f)
-
-            # Restore from memory buffer
-            import io
-
-            buffer = io.BytesIO(backup_data)
-            autocrud.load(buffer)
-
-            # Download and restore from cloud storage
-            import boto3
-
-            s3 = boto3.client("s3")
-            with io.BytesIO() as buffer:
-                s3.download_fileobj("backup-bucket", "autocrud-backup.tar", buffer)
-                buffer.seek(0)
-                autocrud.load(buffer)
-            ```
-
-        Behavior:
-            - Only loads data for models that are registered with add_model()
-            - Preserves all metadata including timestamps and user information
-            - Restores complete revision history for each resource
-            - Maintains data integrity and relationships
-            - Handles both active and soft-deleted resources
-
-        Migration Scenarios:
-            ```python
-            # Environment migration
-            # On source system:
-            autocrud_source.dump(backup_file)
-
-            # On target system:
-            autocrud_target.add_model(User)  # Must add models first
-            autocrud_target.add_model(Post)
-            autocrud_target.load(backup_file)
-            ```
-
-        Error Handling:
-            - Raises ValueError if archive contains unknown models
-            - Raises ValueError if archive format is invalid
-            - Existing resources may be overwritten depending on storage backend
-
-        Use Cases:
-            - Disaster recovery and data restoration
-            - Environment migrations (dev → staging → prod)
-            - Data seeding for testing environments
-            - Historical data imports
-            - System migrations and upgrades
-
-        Important Notes:
-            - Models must be registered before loading data for them
-            - Archive must be created by a compatible dump() method
-            - Loading may overwrite existing resources with same IDs
-            - Consider backup existing data before loading
-            - Large archives may take significant time to process
+        Raises:
+            ValueError: If the stream is not a v2 archive or names a model
+                that is not registered.
         """
-        with tarfile.open(fileobj=bio, mode="r|") as tar:
-            for tarinfo in tar:
-                if not tarinfo.isfile():
-                    raise ValueError(f"TarInfo {tarinfo.name} is not a file.")
-                model_name, key = tarinfo.name.split("/", 1)
-                if model_name in self.resource_managers:
-                    mgr = self.resource_managers[model_name]
-                    mgr.load(key, tar.extractfile(tarinfo))
-                else:
+        reader = DumpStreamReader(bio)
+        try:
+            first = next(reader, None)
+        except (msgspec.MsgspecError, ValueError) as e:
+            raise ValueError(f"Not a dump archive: missing header record ({e}).") from e
+        if not isinstance(first, HeaderRecord):
+            raise ValueError("Not a dump archive: missing header record.")
+        if first.version != 2:
+            raise ValueError(f"Unsupported dump format version {first.version}.")
+
+        mgr = None
+        for record in reader:
+            if isinstance(record, ModelStartRecord):
+                if record.model_name not in self.resource_managers:
                     raise ValueError(
-                        f"Model {model_name} not found in resource managers.",
+                        f"Model {record.model_name!r} not found in resource managers "
+                        f"(registered: {', '.join(self.resource_managers) or 'none'}).",
                     )
+                mgr = self.resource_managers[record.model_name]
+            elif isinstance(record, ModelEndRecord):
+                mgr = None
+            elif isinstance(record, (MetaRecord, RevisionRecord)):
+                if mgr is None:
+                    raise ValueError(
+                        f"{type(record).__name__} outside of a model section.",
+                    )
+                mgr.load(record)
+            elif isinstance(record, EofRecord):
+                break

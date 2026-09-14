@@ -41,6 +41,17 @@ class Resource(Struct, Generic[T]):
     data: T
 
 
+class RawResource(Struct):
+    """A revision with its payload left as encoded bytes.
+
+    This is what a ``RevisionRecord`` in a dump archive carries; ``raw_data``
+    is the payload in the *target* encoding chosen at dump time.
+    """
+
+    info: RevisionInfo
+    raw_data: bytes
+
+
 class ResourceMeta(Struct, kw_only=True):
     current_revision_id: str
     resource_id: str
@@ -739,7 +750,7 @@ OnSuccessDump = defstruct(
     [
         *_on_success_context,
         *_dump_context,
-        ("result", Generator[tuple[str, IO[bytes]], None, None]),
+        ("result", Generator[Any, None, None]),  # MetaRecord | RevisionRecord
     ],
     **_type_setting,
 )
@@ -760,7 +771,7 @@ OnFailureDump = defstruct(
 
 _load_context = [
     ("action", Literal[ResourceAction.load], ResourceAction.load),
-    ("key", str),
+    ("key", str),  # record type name: "MetaRecord" | "RevisionRecord"
 ]
 
 BeforeLoad = defstruct(
@@ -1187,74 +1198,22 @@ class IResourceManager(ABC, Generic[T]):
         """
 
     @abstractmethod
-    def dump(self) -> Generator[tuple[str, IO[bytes]]]:
-        """Dump all resource data as a series of tar archive entries.
+    def dump(self, *, encoding: str = "json") -> "Generator[Any]":
+        """Export every resource as dump records.
 
-        Returns:
-            - Generator[tuple[str, IO[bytes]]]: generator yielding (filename, fileobj) pairs for each resource.
+        Yields ``MetaRecord`` objects (one per resource, soft-deleted ones
+        included) followed by ``RevisionRecord`` objects (one per revision),
+        both from :mod:`autocrud.resource_manager.dump_format`. ``AutoCRUD.dump``
+        frames them into the specstar ``.acbak`` v2 archive.
 
-        ---
-
-        Exports all resources in the manager as a series of tar archive entries.
-        Each entry represents one resource and contains both its metadata and
-        all revision data in a structured format.
-
-        The generator yields tuples where:
-        - filename: A unique identifier for the resource (typically the resource_id)
-        - fileobj: An IO[bytes] object containing the tar archive data for that resource
-
-        This method is designed for:
-        - Complete data backup and export operations
-        - Migrating resources between different systems
-        - Creating portable resource archives
-        - Bulk data transfer scenarios
-
-        The tar archive format ensures that all resource information including
-        metadata, revision history, and data content is preserved in a
-        standardized, portable format.
-
-        Note: This method does not filter by deletion status, so both active
-        and soft-deleted resources will be included in the dump.
+        Arguments:
+            - encoding: ``"json"`` or ``"msgpack"`` — the encoding of each
+              revision's payload bytes inside the records.
         """
 
     @abstractmethod
-    def load(self, key: str, bio: IO[bytes]) -> None:
-        """Load resource data from a tar archive entry.
-
-        Arguments:
-            - key (str): the unique identifier for the resource being loaded.
-            - bio (IO[bytes]): the tar archive containing the resource data.
-
-        ---
-
-        Imports a single resource from a tar archive entry, typically created
-        by the dump() method. The tar archive should contain both metadata
-        and all revision data for the resource.
-
-        The key parameter serves as the resource identifier and should match
-        the filename used when the resource was dumped. The bio parameter
-        contains the complete tar archive data for that specific resource.
-
-        This method handles:
-        - Extracting metadata and revision information from the archive
-        - Restoring all historical revisions with proper parent-child relationships
-        - Maintaining data integrity and revision ordering
-        - Preserving timestamps, user information, and other metadata
-
-        Use Cases:
-        - Restoring resources from backup archives
-        - Importing resources from external systems
-        - Migrating data between different AutoCRUD instances
-        - Bulk resource restoration operations
-
-        Behavior:
-        - If a resource with the same key already exists, the behavior depends on implementation
-        - All revision history and metadata from the archive will be restored
-        - The resource's deletion status and other flags are preserved as archived
-
-        Note: This method should be used in conjunction with dump() for
-        complete backup and restore workflows.
-        """
+    def load(self, record: Any) -> None:
+        """Store one ``MetaRecord`` / ``RevisionRecord`` produced by :meth:`dump`."""
 
 
 class IMigration(ABC):

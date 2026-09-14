@@ -6,6 +6,16 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-compatible-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+> **0.4.6 — 這是 0.4.x 的最後一個版本，只做一件事：讓你把資料搬到 [specstar](https://pypi.org/project/specstar/)。**
+> `AutoCRUD.dump()` 在 0.4.0–0.4.5 一呼叫就 `TypeError`，0.4.6 修好並改成直接輸出 specstar 的 `.acbak` 備份格式：
+>
+> ```python
+> with open("backup.acbak", "wb") as f:
+>     crud.dump(f)          # 之後在 specstar 上：spec.load(open("backup.acbak", "rb"))
+> ```
+>
+> 完整步驟見 [Upgrading from autocrud 0.4.x](https://hychou0515.github.io/specstar/guides/upgrade-from-0.4/)。
+
 ## ✨ 特色功能
 
 - 🎯 **多數據類型支持**: TypedDict、dataclass、msgspec.Struct

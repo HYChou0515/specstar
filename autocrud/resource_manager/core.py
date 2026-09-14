@@ -4,7 +4,6 @@ from contextlib import contextmanager, suppress
 from functools import cached_property, wraps
 import traceback
 from typing import (
-    IO,
     TYPE_CHECKING,
     Any,
     Generic,
@@ -78,6 +77,7 @@ from autocrud.types import (
     OnSuccessSearchResources,
     OnSuccessSwitch,
     OnSuccessUpdate,
+    RawResource,
     Resource,
     ResourceAction,
     ResourceIDNotFoundError,
@@ -105,6 +105,7 @@ from autocrud.resource_manager.basic import (
     MsgspecSerializer,
 )
 from autocrud.resource_manager.data_converter import DataConverter
+from autocrud.resource_manager.dump_format import MetaRecord, RevisionRecord
 from autocrud.util.naming import NameConverter, NamingFormat
 
 T = TypeVar("T")
@@ -128,6 +129,20 @@ def _get_type_name(resource_type) -> str:
 
     # 後備方案
     return str(resource_type).replace(" ", "").replace("|", "Or")
+
+
+class _ExportResourceMeta(ResourceMeta, kw_only=True):
+    """``ResourceMeta`` plus the current-revision mirror fields specstar stores.
+
+    Dump-only: the runtime ``ResourceMeta`` is untouched, so nothing on disk
+    changes shape. All five default to ``UNSET`` (omitted when encoded).
+    """
+
+    rev_status: RevisionStatus | UnsetType = UNSET
+    rev_created_by: str | UnsetType = UNSET
+    rev_updated_by: str | UnsetType = UNSET
+    rev_created_time: dt.datetime | UnsetType = UNSET
+    rev_updated_time: dt.datetime | UnsetType = UNSET
 
 
 class SimpleStorage(IStorage[T]):
@@ -678,34 +693,83 @@ class ResourceManager(IResourceManager[T], Generic[T]):
 
     @execute_with_events(
         (BeforeDump, AfterDump, OnSuccessDump, OnFailureDump),
-        lambda _: {},
+        "result",
+        inputs={"encoding": UNSET},
     )
-    def dump(self) -> Generator[tuple[str, IO[bytes]]]:
+    def dump(
+        self, *, encoding: Encoding = Encoding.json
+    ) -> Generator[MetaRecord | RevisionRecord]:
+        payload_encoder = MsgspecSerializer(
+            encoding=encoding, resource_type=self.resource_type
+        )
         for meta in self.storage.dump_meta():
-            yield f"meta/{meta.resource_id}", self.meta_serializer.encode(meta)
+            yield MetaRecord(data=self.meta_serializer.encode(self._export_meta(meta)))
         for resource in self.storage.dump_resource():
-            yield f"data/{resource.info.uid}", self.resource_serializer.encode(resource)
+            raw_data = payload_encoder.encode(resource.data)
+            info = resource.info
+            # The hash is defined over the stored bytes; re-deriving it keeps it
+            # true whether the target encoding matches the store's or not (same
+            # encoding -> same deterministic bytes -> same hash as before).
+            info.data_hash = f"xxh3_128:{xxh3_128_hexdigest(raw_data)}"
+            yield RevisionRecord(
+                data=self.resource_serializer.encode(
+                    RawResource(info=info, raw_data=raw_data)
+                )
+            )
 
     @execute_with_events(
         (BeforeLoad, AfterLoad, OnSuccessLoad, OnFailureLoad),
         lambda _: {},
-        inputs={"bio": UNSET},
+        inputs={"record": UNSET, "key": "record.__class__.__name__"},
     )
-    def load(self, key: str, bio: IO[bytes]) -> None:
-        if key.startswith("meta/"):
-            self.storage.save_meta(self.meta_serializer.decode(bio.read()))
-        elif key.startswith("data/"):
+    def load(self, record: MetaRecord | RevisionRecord) -> None:
+        if isinstance(record, MetaRecord):
+            self.storage.save_meta(self.meta_serializer.decode(record.data))
+        elif isinstance(record, RevisionRecord):
+            raw = self.resource_serializer.decode(record.data)
             self.storage.save_resource_revision(
-                self.resource_serializer.decode(bio.read()),
+                Resource(info=raw.info, data=self._decode_payload(raw.raw_data)),
             )
+
+    def _export_meta(self, meta: ResourceMeta) -> "_ExportResourceMeta":
+        """Mirror the current revision's info onto the meta (specstar >= 0.9
+        keeps these ``rev_*`` fields on ``ResourceMeta``; filling them here
+        means the importer needs no backfill pass)."""
+        export = _ExportResourceMeta(**msgspec.structs.asdict(meta))
+        try:
+            info = self.storage.get_resource_revision_info(
+                meta.resource_id, meta.current_revision_id
+            )
+        except Exception:
+            return export  # unreadable current revision: leave UNSET
+        export.rev_status = info.status
+        export.rev_created_by = info.created_by
+        export.rev_updated_by = info.updated_by
+        export.rev_created_time = info.created_time
+        export.rev_updated_time = info.updated_time
+        return export
+
+    def _decode_payload(self, raw_data: bytes) -> T:
+        # An archive carries the payload in whichever encoding it was dumped
+        # with; a JSON object always starts with ``{`` (msgspec emits no
+        # leading whitespace), a msgpack map never does.
+        if raw_data[:1] == b"{":
+            return self._json_payload_decoder.decode(raw_data)
+        return self._msgpack_payload_decoder.decode(raw_data)
+
+    @cached_property
+    def _json_payload_decoder(self):
+        return msgspec.json.Decoder(self.resource_type)
+
+    @cached_property
+    def _msgpack_payload_decoder(self):
+        return msgspec.msgpack.Decoder(self.resource_type)
 
     @cached_property
     def meta_serializer(self):
+        # Decodes plain ResourceMeta; encodes _ExportResourceMeta too (a subclass).
         return MsgspecSerializer(encoding=Encoding.msgpack, resource_type=ResourceMeta)
 
     @cached_property
     def resource_serializer(self):
-        return MsgspecSerializer(
-            encoding=Encoding.msgpack,
-            resource_type=Resource[self.resource_type],
-        )
+        return MsgspecSerializer(encoding=Encoding.msgpack, resource_type=RawResource)
