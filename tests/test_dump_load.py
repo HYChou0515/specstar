@@ -2,6 +2,7 @@
 
 import datetime as dt
 import io
+from pathlib import Path
 
 import msgspec
 import pytest
@@ -10,7 +11,13 @@ from xxhash import xxh3_128_hexdigest
 
 from autocrud.crud.core import AutoCRUD
 from autocrud.resource_manager.dump_format import DumpStreamReader
-from autocrud.resource_manager.storage_factory import DiskStorageFactory
+from autocrud.resource_manager.core import SimpleStorage
+from autocrud.resource_manager.meta_store.sqlite3 import FileSqliteMetaStore
+from autocrud.resource_manager.resource_store.simple import DiskResourceStore
+from autocrud.resource_manager.storage_factory import (
+    DiskStorageFactory,
+    IStorageFactory,
+)
 from autocrud.types import (
     RawResource,
     ResourceIsDeletedError,
@@ -26,11 +33,43 @@ class User(Struct):
 T0 = dt.datetime(2025, 9, 1, 12, 0, 0)
 
 
-def _disk_crud(root, *models) -> AutoCRUD:
-    crud = AutoCRUD(storage_factory=DiskStorageFactory(root))
-    for m in models:
-        crud.add_model(m)
-    return crud
+class SqliteDiskStorageFactory(IStorageFactory):
+    """The other common 0.4.x persistence setup (#448): a local SQLite file for
+    metadata, plain files for revisions — composed by hand, since 0.4.x shipped
+    no factory for it."""
+
+    def __init__(self, rootdir):
+        self.rootdir = Path(rootdir)
+
+    def build(self, model, model_name, *, migration=None):
+        self.rootdir.mkdir(parents=True, exist_ok=True)
+        return SimpleStorage(
+            FileSqliteMetaStore(db_filepath=self.rootdir / f"{model_name}.sqlite3"),
+            DiskResourceStore(
+                resource_type=model,
+                rootdir=self.rootdir / model_name / "data",
+                migration=migration,
+            ),
+        )
+
+
+STORAGES = {
+    "disk": DiskStorageFactory,
+    "sqlite+disk": SqliteDiskStorageFactory,
+}
+
+
+@pytest.fixture(params=list(STORAGES))
+def make_crud(request):
+    """``make_crud(root, *models)`` → an AutoCRUD on the parametrized storage."""
+
+    def _make(root, *models) -> AutoCRUD:
+        crud = AutoCRUD(storage_factory=STORAGES[request.param](root))
+        for m in models:
+            crud.add_model(m)
+        return crud
+
+    return _make
 
 
 def _round_trip(src: AutoCRUD, dst: AutoCRUD) -> bytes:
@@ -41,13 +80,13 @@ def _round_trip(src: AutoCRUD, dst: AutoCRUD) -> bytes:
     return raw
 
 
-def test_dump_then_load_round_trips_one_resource(tmp_path):
-    src = _disk_crud(tmp_path / "src", User)
+def test_dump_then_load_round_trips_one_resource(tmp_path, make_crud):
+    src = make_crud(tmp_path / "src", User)
     users = src.get_resource_manager(User)
     with users.meta_provide("alice", T0):
         info = users.create(User(name="a", age=1))
 
-    dst = _disk_crud(tmp_path / "dst", User)
+    dst = make_crud(tmp_path / "dst", User)
     _round_trip(src, dst)
 
     loaded = dst.get_resource_manager(User)
@@ -57,8 +96,8 @@ def test_dump_then_load_round_trips_one_resource(tmp_path):
     assert loaded.get_meta(info.resource_id) == users.get_meta(info.resource_id)
 
 
-def test_history_soft_delete_and_switch_survive_round_trip(tmp_path):
-    src = _disk_crud(tmp_path / "src", User)
+def test_history_soft_delete_and_switch_survive_round_trip(tmp_path, make_crud):
+    src = make_crud(tmp_path / "src", User)
     users = src.get_resource_manager(User)
     with users.meta_provide("alice", T0):
         r1 = users.create(User(name="v1", age=1))
@@ -71,7 +110,7 @@ def test_history_soft_delete_and_switch_survive_round_trip(tmp_path):
     with users.meta_provide("carol", T0 + dt.timedelta(days=1)):
         users.delete(gone.resource_id)
 
-    dst = _disk_crud(tmp_path / "dst", User)
+    dst = make_crud(tmp_path / "dst", User)
     _round_trip(src, dst)
     loaded = dst.get_resource_manager(User)
 
@@ -116,8 +155,10 @@ def _records(raw: bytes) -> list:
     return list(DumpStreamReader(io.BytesIO(raw)))
 
 
-def test_archive_is_specstar_v2_with_current_revision_fields_on_meta(tmp_path):
-    src = _disk_crud(tmp_path / "src", User)
+def test_archive_is_specstar_v2_with_current_revision_fields_on_meta(
+    tmp_path, make_crud
+):
+    src = make_crud(tmp_path / "src", User)
     users = src.get_resource_manager(User)
     with users.meta_provide("alice", T0):
         r1 = users.create(User(name="v1", age=1))
@@ -165,8 +206,8 @@ def test_archive_is_specstar_v2_with_current_revision_fields_on_meta(tmp_path):
     assert by_rev[r2.revision_id].info.parent_revision_id == r1.revision_id
 
 
-def test_dump_encoding_msgpack_transcodes_payload_and_rehashes(tmp_path):
-    src = _disk_crud(tmp_path / "src", User)
+def test_dump_encoding_msgpack_transcodes_payload_and_rehashes(tmp_path, make_crud):
+    src = make_crud(tmp_path / "src", User)
     users = src.get_resource_manager(User)
     with users.meta_provide("alice", T0):
         r1 = users.create(User(name="v1", age=1))
@@ -184,7 +225,7 @@ def test_dump_encoding_msgpack_transcodes_payload_and_rehashes(tmp_path):
     assert raw.info.data_hash != r1.data_hash  # the hash follows the bytes
 
     # and the archive still restores (payload encoding is sniffed per record)
-    dst = _disk_crud(tmp_path / "dst", User)
+    dst = make_crud(tmp_path / "dst", User)
     dst.load(io.BytesIO(bio.getvalue()))
     assert dst.get_resource_manager(User).get(r1.resource_id).data == User(
         name="v1", age=1
@@ -195,8 +236,10 @@ class Note(Struct):
     body: str
 
 
-def test_every_model_gets_its_own_section_and_unknown_models_are_refused(tmp_path):
-    src = _disk_crud(tmp_path / "src", User, Note)
+def test_every_model_gets_its_own_section_and_unknown_models_are_refused(
+    tmp_path, make_crud
+):
+    src = make_crud(tmp_path / "src", User, Note)
     with src.get_resource_manager(User).meta_provide("alice", T0):
         u = src.get_resource_manager(User).create(User(name="u", age=1))
     with src.get_resource_manager(Note).meta_provide("alice", T0):
@@ -211,20 +254,20 @@ def test_every_model_gets_its_own_section_and_unknown_models_are_refused(tmp_pat
     ]
     assert sections == ["user", "note"]
 
-    dst = _disk_crud(tmp_path / "dst", User, Note)
+    dst = make_crud(tmp_path / "dst", User, Note)
     dst.load(io.BytesIO(bio.getvalue()))
     assert dst.get_resource_manager(User).get(u.resource_id).data == User(
         name="u", age=1
     )
     assert dst.get_resource_manager(Note).get(n.resource_id).data == Note(body="n")
 
-    only_user = _disk_crud(tmp_path / "only_user", User)
+    only_user = make_crud(tmp_path / "only_user", User)
     with pytest.raises(ValueError, match="'note'.*registered: user"):
         only_user.load(io.BytesIO(bio.getvalue()))
 
 
-def test_load_rejects_a_stream_that_is_not_an_archive(tmp_path):
-    crud = _disk_crud(tmp_path / "x", User)
+def test_load_rejects_a_stream_that_is_not_an_archive(tmp_path, make_crud):
+    crud = make_crud(tmp_path / "x", User)
     with pytest.raises(ValueError, match="missing header record"):
         crud.load(io.BytesIO(b""))
     with pytest.raises(ValueError, match="missing header record"):
@@ -244,8 +287,10 @@ def _section_ids(raw: bytes) -> dict[str, list[str]]:
     return out
 
 
-def test_dump_query_exports_only_resources_touched_since_with_full_history(tmp_path):
-    src = _disk_crud(tmp_path / "src", User)
+def test_dump_query_exports_only_resources_touched_since_with_full_history(
+    tmp_path, make_crud
+):
+    src = make_crud(tmp_path / "src", User)
     users = src.get_resource_manager(User)
     cutoff = T0 + dt.timedelta(days=1)
     before, after = T0, cutoff + dt.timedelta(hours=1)
@@ -286,7 +331,7 @@ def test_dump_query_exports_only_resources_touched_since_with_full_history(tmp_p
     assert len(exported[updated.resource_id]) == 2
 
     # importing the delta over a full import leaves the target equal to the source
-    dst = _disk_crud(tmp_path / "dst", User)
+    dst = make_crud(tmp_path / "dst", User)
     dst.load(io.BytesIO(bio.getvalue()))
     got = dst.get_resource_manager(User)
     assert got.get(switched.resource_id).data == User(name="s1", age=1)
@@ -294,8 +339,8 @@ def test_dump_query_exports_only_resources_touched_since_with_full_history(tmp_p
     assert got.storage.get_meta(deleted.resource_id).is_deleted is True
 
 
-def test_dump_query_ignores_the_default_page_size(tmp_path):
-    src = _disk_crud(tmp_path / "src", User)
+def test_dump_query_ignores_the_default_page_size(tmp_path, make_crud):
+    src = make_crud(tmp_path / "src", User)
     users = src.get_resource_manager(User)
     with users.meta_provide("alice", T0):
         for i in range(25):  # > ResourceMetaSearchQuery.limit default of 10
