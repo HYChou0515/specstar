@@ -214,14 +214,23 @@ deployment; deleting them is the only irreversible step in this guide.
 
 ---
 
-## Not covered
+## Which 0.4.x setups are covered
 
-- **0.4.x with hand-composed stores** (a `SqliteMetaStore` / `PostgresMetaStore`
-  / `S3ResourceStore` wired up manually instead of `DiskStorageFactory`):
-  `dump()` goes through the `IStorage` interface, so it should work on any
-  backend, but only `DiskStorageFactory` deployments are covered by tests.
-  Please [open an issue](https://github.com/HYChou0515/specstar/issues) with
-  the backend combination if you hit a problem.
+`dump()` goes through the `IStorage` interface, so any backend combination
+should export. Two are exercised by tests against the real 0.4.6 package:
+
+- `DiskStorageFactory` — the setup the 0.4.x docs recommended.
+- A hand-composed **local SQLite meta store + disk revisions**
+  (`SimpleStorage(FileSqliteMetaStore(...), DiskResourceStore(...))`), the
+  setup behind #448. The delta query (`updated_time_start=`) runs as SQL
+  on the SQLite side; the archive it produces is identical in shape.
+
+Other hand-composed backends (`PostgresMetaStore`, `RedisMetaStore`,
+`S3ResourceStore`) are untested — please
+[open an issue](https://github.com/HYChou0515/specstar/issues) with the
+combination if you hit a problem.
+
+## Not covered
 - **0.5 – 0.8.2 tar archives**: those versions had a working tar-based
   `dump()`; specstar does not read it. Upgrade to 0.8.3+ first (framed
   archive) or open an issue.

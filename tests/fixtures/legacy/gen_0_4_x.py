@@ -5,9 +5,11 @@ Run this with the *old* package installed, never with ``specstar``::
     uv venv /tmp/ac046 && uv pip install --python /tmp/ac046/bin/python autocrud==0.4.6
     /tmp/ac046/bin/python tests/fixtures/legacy/gen_0_4_x.py
 
-It builds a 0.4.x ``DiskStorageFactory`` deployment in a temp dir (the
-layout 0.4.0–0.4.5 wrote; 0.4.6 changes nothing on disk) and writes, next
-to itself:
+It builds a 0.4.x deployment in a temp dir the way the #448 reporter runs
+theirs — a local SQLite file for metadata (``FileSqliteMetaStore``) and
+plain files for revisions (``DiskResourceStore``), composed by hand since
+0.4.x ships no factory for that pair (the layout 0.4.0–0.4.5 wrote; 0.4.6
+changes nothing on disk) — and writes, next to itself:
 
 * ``0_4_x/backup.acbak``  – ``AutoCRUD.dump()`` output, i.e. what a 0.4.x
   user hands to ``SpecStar.load()``
@@ -33,7 +35,10 @@ from uuid import UUID
 
 import msgspec
 from autocrud.crud.core import AutoCRUD
-from autocrud.resource_manager.storage_factory import DiskStorageFactory
+from autocrud.resource_manager.core import SimpleStorage
+from autocrud.resource_manager.meta_store.sqlite3 import FileSqliteMetaStore
+from autocrud.resource_manager.resource_store.simple import DiskResourceStore
+from autocrud.resource_manager.storage_factory import IStorageFactory
 from autocrud.types import ResourceMetaSearchQuery
 from msgspec import Struct
 
@@ -66,12 +71,28 @@ class Note(Struct):
     count: int = 0
 
 
+class SqliteDiskStorageFactory(IStorageFactory):
+    def __init__(self, rootdir: Path):
+        self.rootdir = rootdir
+
+    def build(self, model, model_name, *, migration=None):
+        self.rootdir.mkdir(parents=True, exist_ok=True)
+        return SimpleStorage(
+            FileSqliteMetaStore(db_filepath=self.rootdir / f"{model_name}.sqlite3"),
+            DiskResourceStore(
+                resource_type=model,
+                rootdir=self.rootdir / model_name / "data",
+                migration=migration,
+            ),
+        )
+
+
 def main() -> None:
     if OUT.exists():
         shutil.rmtree(OUT)
     OUT.mkdir()
     disk = Path(tempfile.mkdtemp(prefix="autocrud-0.4.x-"))
-    crud = AutoCRUD(storage_factory=DiskStorageFactory(disk))
+    crud = AutoCRUD(storage_factory=SqliteDiskStorageFactory(disk))
     tick = itertools.count(1)
     note = itertools.count(1)
     crud.add_model(

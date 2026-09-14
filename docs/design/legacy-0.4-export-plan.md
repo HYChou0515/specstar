@@ -112,7 +112,7 @@ python -c 'from myapp import spec; print(spec.load(open("backup.acbak", "rb")))'
 # 4. 切換流量;舊目錄保留到確認無誤
 ```
 
-不在範圍(文件註明「開 issue」):0.4.x 手動組 SQLite / Postgres / Redis meta store 或 S3 resource store 的使用者——`dump()` 走 `IStorage` 介面,理論上任何後端都能匯出,但只對 `DiskStorageFactory` 做過測試。
+不在範圍(文件註明「開 issue」):0.4.x 手動組 Postgres / Redis meta store 或 S3 resource store 的使用者——`dump()` 走 `IStorage` 介面,理論上任何後端都能匯出,但只對 `DiskStorageFactory` 與 **local SQLite meta + disk revisions**(#448 回報者的實際配置,owner 事後告知)做過測試;0.4.6 的測試對這兩種 storage parametrize,fixture 改用 sqlite+disk 產生。
 
 ---
 
