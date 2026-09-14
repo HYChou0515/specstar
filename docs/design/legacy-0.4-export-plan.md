@@ -1,6 +1,6 @@
 # autocrud 0.4.x → specstar 資料遷移(0.4.6 export → specstar import)— 實作 Plan
 
-> **狀態**:**DONE**(`release/0.4.6` 已 commit + tag `v0.4.6`,本地未 push;specstar 側 fixture / 測試 / 文件完成,零程式碼變更)
+> **狀態**:**DONE**(`release/0.4.6` 已 commit + tag `v0.4.6`,本地未 push;specstar 側 PR #449)。後續追加兩項(owner 提問後定案):**0.4.6 `dump(query=)` 增量匯出**、**specstar `load()` 分批 flush**——見文末「追加」。
 > **Branch**:`release/0.4.6`(base `v0.4.5`,只 tag 不合回 master)+ `fix/448-legacy-import`(specstar master 側:fixture / 測試 / 文件)
 > **Issue**:[#448](https://github.com/HYChou0515/specstar/issues/448)「autocrud v0.4.3 migrate 方法 — 有什麼方法可以安全的 migrate 到新版本? 資料不能丟」
 > **動機**:`MIGRATION.md` 只講 0.10 的 `autocrud → specstar` 改名,對 0.4.x 的**儲存格式**完全沒著墨;0.4.x 的磁碟 layout 與 dump 格式和現在完全不同,新版讀不到。定案做法:**出 `autocrud 0.4.6`,讓舊版直接寫出 specstar 現行的 `.acbak` v2 格式**,使用者升版後用現成的 `spec.load()` 匯入。
@@ -130,3 +130,20 @@ python -c 'from myapp import spec; print(spec.load(open("backup.acbak", "rb")))'
 - **新版直接讀 0.4.x disk layout**(`SpecStar.load_legacy_disk(rootdir)`):不用裝舊版,但要在新版永久維護一個舊 layout reader;owner 選擇 export/import 路線。
 - **新版 `load()` 自動偵測 0.5–0.8.2 的 tar dump**:與 #448 無關(0.4.x 沒有可用的 tar),不做。
 - **在舊環境跑的獨立匯出腳本**:0.4.6 本身就是那個腳本,且能 `pip install`,更好。
+
+---
+
+## 追加(plan 定案後 owner 提問衍生)
+
+### 1. 大量資料的停機時間 → 0.4.6 `dump(query=ResourceMetaSearchQuery)`(commit `68b46a1`,tag 重打)
+- 篩選單位是 **resource**;命中的 resource 連同**全部** revision 匯出,所以 delta 用 overwrite 疊在 full 上是 idempotent。
+- `updated_time` 在 0.4.x 會被 update / patch / switch / delete / restore 更新(確認過),soft-delete 不會漏。
+- `limit` / `offset` 強制 unlimited。
+- 流程:`t0 = now()` → full dump(舊系統繼續跑)→ 匯入驗證 → 切換時 `dump(query=updated_time_start=t0)` → `spec.load(delta)`。`t0` 取 full dump **開始**前。
+- fixture 加 `delta.acbak` + `manifest_after_delta.json`;`test_full_then_delta_import_equals_the_source_after_cutover` 三後端全綠。
+
+### 2. 大量資料的記憶體峰值 → specstar `SpecStar.load(*, batch_size=1000, batch_bytes=64MiB)`(commit `7b32ded`)
+- 原本整個 model section 先 buffer 再一次 `load_records_bulk()`,實測峰值 ≈ **2.3×** section bytes;改成每 N 筆 / M bytes flush,100 筆一批實測 **0.25×**。
+- `load_records_bulk(..., skipped_ids=)` 讓 `on_duplicate=skip` 的「被 skip 的 resource 其 revision 也要 skip」跨批次成立(`test_skip_holds_across_flush_boundaries` 用 `batch_size=1` 逼出邊界)。
+- `/_backup/import`、`/{model}/import` 改餵 `UploadFile.file`(spooled temp file),不再 `read()` 整包;raw body 路徑本質上仍是整包。
+- 沒做:0.4.6 的 `GET /_backup/export` HTTP route(搬家是 owner 跑一次腳本,不需要對外開全量匯出口;0.4.x 預設 `AllowAll`)、0.4.6 per-model `dump(models=...)`。

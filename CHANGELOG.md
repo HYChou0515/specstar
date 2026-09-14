@@ -17,7 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   imports unchanged (revision history, soft-deletes, `switch()`-ed
   currents, `indexed_data`, and pre-filled `rev_*` mirror fields). Pinned
   by a fixture generated with the real 0.4.6 package
-  (`tests/test_legacy_load.py`).
+  (`tests/test_legacy_load.py`). 0.4.6's `dump(query=...)` exports only the
+  resources a `ResourceMetaSearchQuery` selects (each with its full
+  history), so a large store moves as a full export plus a delta at cutover.
+- `SpecStar.load(bio, *, batch_size=1000, batch_bytes=64 MiB)`: records are
+  written in batches as the archive is read instead of buffering a whole
+  model section first. Peak memory drops from ~2.3x the section to a
+  fraction of the batch; `on_duplicate=skip` still skips a resource's
+  revisions when they arrive in a later batch. `POST /_backup/import` and
+  `POST /{model}/import` stream a multipart upload from its spooled file
+  instead of reading it whole.
 
 
 ### Documentation

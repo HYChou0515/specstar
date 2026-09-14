@@ -27,7 +27,7 @@
     "note:2": {
       "created_by": "dave",
       "created_time": "2025-09-01T12:00:00",
-      "current_revision_id": "note:2:1",
+      "current_revision_id": "note:2:2",
       "indexed_data": {},
       "is_deleted": false,
       "revisions": {
@@ -42,21 +42,33 @@
           "parent_revision_id": null,
           "status": "stable",
           "uid": "79ccbbb1-487c-43aa-ba9d-e618024f7102"
+        },
+        "note:2:2": {
+          "created_by": "erin",
+          "created_time": "2025-09-08T13:00:00",
+          "data": {
+            "body": "世界 v2",
+            "count": 3
+          },
+          "data_hash": "xxh3_128:2180413ba9717904f1d66925dca2e24f",
+          "parent_revision_id": "note:2:1",
+          "status": "stable",
+          "uid": "8fd8fc5d-727e-482c-ac8c-c68dc03a5b0c"
         }
       },
-      "total_revision_count": 1,
-      "updated_by": "dave",
-      "updated_time": "2025-09-01T12:00:00"
+      "total_revision_count": 2,
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
     }
   },
   "ticket": {
     "ticket:1": {
       "created_by": "alice",
       "created_time": "2025-09-01T12:00:00",
-      "current_revision_id": "ticket:1:3",
+      "current_revision_id": "ticket:1:4",
       "indexed_data": {
         "priority": "low",
-        "title": "A third"
+        "title": "A fourth"
       },
       "is_deleted": false,
       "revisions": {
@@ -121,11 +133,31 @@
           "parent_revision_id": "ticket:1:2",
           "status": "stable",
           "uid": "d0ff81ab-7055-4670-9eae-bb4d18738d8d"
+        },
+        "ticket:1:4": {
+          "created_by": "erin",
+          "created_time": "2025-09-08T13:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": 0.0,
+            "tags": [
+              "z"
+            ],
+            "title": "A fourth"
+          },
+          "data_hash": "xxh3_128:84acc7a8ad4dda9288e88327903d85e7",
+          "parent_revision_id": "ticket:1:3",
+          "status": "stable",
+          "uid": "835bcfb0-6d0b-40a8-bfd6-d761639a9eac"
         }
       },
-      "total_revision_count": 3,
-      "updated_by": "bob",
-      "updated_time": "2025-09-01T14:00:00"
+      "total_revision_count": 4,
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
     },
     "ticket:2": {
       "created_by": "alice",
@@ -135,7 +167,7 @@
         "priority": "low",
         "title": "B gone"
       },
-      "is_deleted": true,
+      "is_deleted": false,
       "revisions": {
         "ticket:2:1": {
           "created_by": "alice",
@@ -157,8 +189,8 @@
         }
       },
       "total_revision_count": 1,
-      "updated_by": "carol",
-      "updated_time": "2025-09-02T12:00:00"
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
     },
     "ticket:3": {
       "created_by": "alice",
@@ -168,7 +200,7 @@
         "priority": "low",
         "title": "C v1"
       },
-      "is_deleted": false,
+      "is_deleted": true,
       "revisions": {
         "ticket:3:1": {
           "created_by": "alice",
@@ -208,8 +240,41 @@
         }
       },
       "total_revision_count": 2,
-      "updated_by": "alice",
-      "updated_time": "2025-09-01T12:10:00"
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
+    },
+    "ticket:4": {
+      "created_by": "erin",
+      "created_time": "2025-09-08T13:00:00",
+      "current_revision_id": "ticket:4:1",
+      "indexed_data": {
+        "priority": "high",
+        "title": "D new"
+      },
+      "is_deleted": false,
+      "revisions": {
+        "ticket:4:1": {
+          "created_by": "erin",
+          "created_time": "2025-09-08T13:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "high",
+            "ref": null,
+            "score": 0.0,
+            "tags": [],
+            "title": "D new"
+          },
+          "data_hash": "xxh3_128:fa9876b1b119ec773addb8af5e63696d",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "5584927b-5c44-4c2e-8805-16ef0f44d5fa"
+        }
+      },
+      "total_revision_count": 1,
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
     }
   }
 }

@@ -26,6 +26,7 @@ procedure; it stays as the rollback point until you remove it yourself.
 - [ ] Create the specstar project: new imports (`MIGRATION.md`), **new empty storage**
 - [ ] `spec.load()` the archive, check the returned `LoadStats`
 - [ ] Verify counts / revisions / soft-deletes, then switch traffic
+      (big store? full export first, delta at cutover — see *Large deployments*)
 - [ ] Keep the old directory until you are sure
 
 ---
@@ -144,6 +145,64 @@ What the archive carries, and what you should therefore see:
 New writes continue the imported history (`update()` on an imported
 resource gets `parent_revision_id` = the imported current revision and
 bumps `total_revision_count`).
+
+---
+
+## Large deployments
+
+Both sides stream. `dump()` writes one record at a time, and `load()`
+reads one frame at a time and writes in batches (`batch_size=1000`
+records / `batch_bytes=64 MiB` by default), so neither needs the archive —
+or the largest model — to fit in memory. What changes at scale is the
+*downtime*: a full export of a big store takes long enough that the old
+service keeps taking writes meanwhile. Do it in two steps:
+
+```python
+# Step 1 — full export while 0.4.x keeps serving. Note the START time.
+import datetime as dt
+from autocrud.types import ResourceMetaSearchQuery
+
+t0 = dt.datetime.now()   # same kind (naive / aware) as the `now` your app passes to meta_provide()
+with open("full.acbak", "wb") as f:
+    crud.dump(f)
+```
+
+Import `full.acbak` into specstar and verify at leisure (§3). Then, at
+cutover, stop writes on 0.4.x and export only what moved since `t0`:
+
+```python
+# Step 2 — delta: resources touched since t0, each with its whole history
+with open("delta.acbak", "wb") as f:
+    crud.dump(f, query=ResourceMetaSearchQuery(updated_time_start=t0))
+```
+
+```python
+spec.load(open("delta.acbak", "rb"))           # default on_duplicate=overwrite
+```
+
+- `query` selects **resources**, and a selected resource is exported with
+  **all** its revisions, so re-importing it over the full import is an
+  idempotent overwrite — `total_revision_count`, `current_revision_id`
+  and the history always agree.
+- `updated_time` moves on `update`, `patch`, `switch`, `delete` and
+  `restore`, so a resource that was only soft-deleted or switched after
+  `t0` is in the delta too.
+- Take `t0` from *before* the full export started, not after it finished:
+  a write that lands while the export is running may or may not be in
+  `full.acbak`, and the overlap makes that irrelevant.
+- `query` accepts every `ResourceMetaSearchQuery` field
+  (`created_time_*`, `created_bys`, `is_deleted`, …); `limit`/`offset`
+  are ignored.
+
+Two more knobs:
+
+- **Compression.** Both ends only need `write()` / `read(n)`, so
+  `crud.dump(gzip.open("full.acbak.gz", "wb"))` and
+  `spec.load(gzip.open("full.acbak.gz", "rb"))` work as-is; JSON payloads
+  shrink a lot.
+- **HTTP vs Python.** `POST /_backup/import` streams the upload from its
+  spooled temp file, but for multi-GB archives prefer the Python API on
+  the host — no request timeouts, no proxy body limits.
 
 ---
 

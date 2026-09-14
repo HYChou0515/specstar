@@ -14,6 +14,10 @@ to itself:
 * ``0_4_x/manifest.json`` – what the data *is*, read back through the 0.4.x
   API, so the test asserts against the source of truth rather than the
   archive
+* ``0_4_x/delta.acbak`` + ``manifest_after_delta.json`` – the deployment
+  kept running after the full export; the delta is
+  ``dump(query=ResourceMetaSearchQuery(updated_time_start=T_CUT))`` and the
+  second manifest is the final state
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from uuid import UUID
 import msgspec
 from autocrud.crud.core import AutoCRUD
 from autocrud.resource_manager.storage_factory import DiskStorageFactory
+from autocrud.types import ResourceMetaSearchQuery
 from msgspec import Struct
 
 OUT = Path(__file__).parent / "0_4_x"
@@ -121,7 +126,24 @@ def main() -> None:
 
     with (OUT / "backup.acbak").open("wb") as f:
         crud.dump(f)
+    (OUT / "manifest.json").write_text(_manifest(crud))
 
+    # --- life goes on after the full export; then a delta at cutover ------
+    t_cut = t0 + dt.timedelta(days=7)
+    later = t_cut + dt.timedelta(hours=1)
+    with tickets.meta_provide("erin", later):
+        tickets.update(a.resource_id, Ticket(title="A fourth", tags=["z"]))
+        tickets.restore(b.resource_id)
+        tickets.delete(c.resource_id)
+        tickets.create(Ticket(title="D new", priority=Priority.high))
+    with notes.meta_provide("erin", later):
+        notes.update("note:2", Note(body="世界 v2", count=3))
+    with (OUT / "delta.acbak").open("wb") as f:
+        crud.dump(f, query=ResourceMetaSearchQuery(updated_time_start=t_cut))
+    (OUT / "manifest_after_delta.json").write_text(_manifest(crud))
+
+
+def _manifest(crud: AutoCRUD) -> str:
     manifest: dict = {}
     for name, mgr in crud.resource_managers.items():
         model = {}
@@ -154,9 +176,7 @@ def main() -> None:
                 "revisions": revs,
             }
         manifest[name] = model
-    (OUT / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
-    )
+    return json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
 
 
 if __name__ == "__main__":

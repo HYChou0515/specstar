@@ -209,3 +209,57 @@ def test_archive_names_a_model_the_target_does_not_register(tmp_path):
     only_notes.add_model(Note)
     with pytest.raises(ValueError, match="'ticket'"):
         _load(only_notes)
+
+
+def _manifest_state(manifest: dict) -> dict:
+    """Compact, comparable view of a manifest: what each resource *is*."""
+    return {
+        model: {
+            rid: (
+                r["current_revision_id"],
+                r["total_revision_count"],
+                r["is_deleted"],
+                r["updated_time"],
+                tuple(sorted(r["revisions"])),
+            )
+            for rid, r in resources.items()
+        }
+        for model, resources in manifest.items()
+    }
+
+
+def _spec_state(spec: SpecStar, manifest: dict) -> dict:
+    out = {}
+    for model, resources in manifest.items():
+        mgr = spec.get_resource_manager(model)
+        out[model] = {}
+        for rid in resources:
+            meta = mgr.get_meta(rid, include_deleted=True)
+            out[model][rid] = (
+                meta.current_revision_id,
+                meta.total_revision_count,
+                meta.is_deleted,
+                meta.updated_time.isoformat(),
+                tuple(sorted(mgr.list_revisions(rid))),
+            )
+    return out
+
+
+def test_full_then_delta_import_equals_the_source_after_cutover(spec):
+    """Large deployments move in two steps: a full export while 0.4.x keeps
+    running, then ``dump(query=updated_time_start=T)`` at cutover. Importing
+    the delta over the full import (default overwrite) must leave the target
+    equal to the source's final state — including resources that were only
+    switched / deleted / restored after T, and every revision of each."""
+    after = json.loads((FIXTURE / "manifest_after_delta.json").read_text())
+    _load(spec)
+    with (FIXTURE / "delta.acbak").open("rb") as f:
+        stats = spec.load(f)
+    assert stats["ticket"].loaded == 4 and stats["note"].loaded == 1  # note:1 untouched
+    assert _spec_state(spec, after) == _manifest_state(after)
+    tickets = spec.get_resource_manager("ticket")
+    assert tickets.get("ticket:1").data.title == "A fourth"  # a revision added after T
+    assert tickets.get("ticket:2").data.title == "B gone"  # restored after T
+    assert (
+        tickets.get_resource_revision("ticket:1", "ticket:1:1").data.title == "A first"
+    )  # history intact
