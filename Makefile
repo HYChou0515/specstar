@@ -227,7 +227,7 @@ release-publish:
 	echo "release → v$$v(上傳由 CI 執行)"; \
 	rm -rf dist; \
 	uv build || exit 1; \
-	uv run twine check dist/* || exit 1; \
+	uvx twine check dist/* || exit 1; \
 	git rev-parse -q --verify "refs/tags/v$$v" >/dev/null || git tag "v$$v"; \
 	git push origin "v$$v"; \
 	echo "✅ 已 push tag v$$v"; \
