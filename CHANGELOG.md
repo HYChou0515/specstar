@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
-## [Unreleased]
+## [0.13.0a4] — 2026-09-15
 
 
 ### Added
@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - New guide *Upgrading from autocrud 0.4.x*; `MIGRATION.md` §8 now points
   0.4 users there instead of at the schema-migration page.
+
+
+### Performance
+
+- Write an archive in bounded batches; stream uploads (#448)
 
 ## [0.13.0a3] — 2026-07-28
 
