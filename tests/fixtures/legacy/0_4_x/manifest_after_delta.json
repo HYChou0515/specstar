@@ -1,0 +1,280 @@
+{
+  "note": {
+    "note:1": {
+      "created_by": "dave",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "note:1:1",
+      "indexed_data": {},
+      "is_deleted": false,
+      "revisions": {
+        "note:1:1": {
+          "created_by": "dave",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "body": "hello",
+            "count": 1
+          },
+          "data_hash": "xxh3_128:dfcc127f3abb91df195785fd8ecf1f3b",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "6edd6ab0-3ff1-44b1-b2db-815993ea6bd0"
+        }
+      },
+      "total_revision_count": 1,
+      "updated_by": "dave",
+      "updated_time": "2025-09-01T12:00:00"
+    },
+    "note:2": {
+      "created_by": "dave",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "note:2:2",
+      "indexed_data": {},
+      "is_deleted": false,
+      "revisions": {
+        "note:2:1": {
+          "created_by": "dave",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "body": "世界",
+            "count": 2
+          },
+          "data_hash": "xxh3_128:ba4e7813836c58ce3ad7043f3d0b1051",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "0d8ba86c-a0e3-4085-bf02-ee8e1aeed162"
+        },
+        "note:2:2": {
+          "created_by": "erin",
+          "created_time": "2025-09-08T13:00:00",
+          "data": {
+            "body": "世界 v2",
+            "count": 3
+          },
+          "data_hash": "xxh3_128:2180413ba9717904f1d66925dca2e24f",
+          "parent_revision_id": "note:2:1",
+          "status": "stable",
+          "uid": "4c9c9195-675d-4612-a21d-06a33b6ae933"
+        }
+      },
+      "total_revision_count": 2,
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
+    }
+  },
+  "ticket": {
+    "ticket:1": {
+      "created_by": "alice",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "ticket:1:4",
+      "indexed_data": {
+        "priority": "low",
+        "title": "A fourth"
+      },
+      "is_deleted": false,
+      "revisions": {
+        "ticket:1:1": {
+          "created_by": "alice",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "address": {
+              "city": "Taipei",
+              "zip": "100"
+            },
+            "due": "2025-10-01T08:30:00",
+            "payload": "AAECYmluYXJ5",
+            "priority": "low",
+            "ref": "12345678-1234-5678-1234-567812345678",
+            "score": 1.5,
+            "tags": [
+              "x"
+            ],
+            "title": "A first"
+          },
+          "data_hash": "xxh3_128:7b095295ca5e9d871b25ba4a72b09e49",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "fec97cb6-7548-4814-b289-33837261f063"
+        },
+        "ticket:1:2": {
+          "created_by": "bob",
+          "created_time": "2025-09-01T13:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "high",
+            "ref": null,
+            "score": 0.0,
+            "tags": [
+              "x",
+              "y"
+            ],
+            "title": "A second"
+          },
+          "data_hash": "xxh3_128:c59e5c3c6225d83dd4ab4526e61d8b4a",
+          "parent_revision_id": "ticket:1:1",
+          "status": "stable",
+          "uid": "e2c642fe-81f1-41b5-b913-7608d1644125"
+        },
+        "ticket:1:3": {
+          "created_by": "bob",
+          "created_time": "2025-09-01T14:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": -2.25,
+            "tags": [],
+            "title": "A third"
+          },
+          "data_hash": "xxh3_128:06d25a073111638e0be834cab0d24b55",
+          "parent_revision_id": "ticket:1:2",
+          "status": "stable",
+          "uid": "1b2aa62f-d249-43bb-8f45-2d9b4d51600d"
+        },
+        "ticket:1:4": {
+          "created_by": "erin",
+          "created_time": "2025-09-08T13:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": 0.0,
+            "tags": [
+              "z"
+            ],
+            "title": "A fourth"
+          },
+          "data_hash": "xxh3_128:84acc7a8ad4dda9288e88327903d85e7",
+          "parent_revision_id": "ticket:1:3",
+          "status": "stable",
+          "uid": "93ecd4f9-4969-4df9-a8db-e6d17e9f7ed8"
+        }
+      },
+      "total_revision_count": 4,
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
+    },
+    "ticket:2": {
+      "created_by": "alice",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "ticket:2:1",
+      "indexed_data": {
+        "priority": "low",
+        "title": "B gone"
+      },
+      "is_deleted": false,
+      "revisions": {
+        "ticket:2:1": {
+          "created_by": "alice",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": 0.0,
+            "tags": [],
+            "title": "B gone"
+          },
+          "data_hash": "xxh3_128:896d8bd1ddce16ae79ddca1279d1716d",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "26e87b74-4905-4720-a980-2ae15496deb8"
+        }
+      },
+      "total_revision_count": 1,
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
+    },
+    "ticket:3": {
+      "created_by": "alice",
+      "created_time": "2025-09-01T12:00:00",
+      "current_revision_id": "ticket:3:1",
+      "indexed_data": {
+        "priority": "low",
+        "title": "C v1"
+      },
+      "is_deleted": true,
+      "revisions": {
+        "ticket:3:1": {
+          "created_by": "alice",
+          "created_time": "2025-09-01T12:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": 0.0,
+            "tags": [],
+            "title": "C v1"
+          },
+          "data_hash": "xxh3_128:073148cd94d2388a0fff844571036a4e",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "88d3ade6-a372-401c-8e71-99bf0c766d30"
+        },
+        "ticket:3:2": {
+          "created_by": "alice",
+          "created_time": "2025-09-01T12:05:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "low",
+            "ref": null,
+            "score": 0.0,
+            "tags": [],
+            "title": "C v2"
+          },
+          "data_hash": "xxh3_128:a26cfddc09067b20bd3fcb8b21071b81",
+          "parent_revision_id": "ticket:3:1",
+          "status": "stable",
+          "uid": "ef322fb5-aa64-43a0-a524-c3df0b1de760"
+        }
+      },
+      "total_revision_count": 2,
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
+    },
+    "ticket:4": {
+      "created_by": "erin",
+      "created_time": "2025-09-08T13:00:00",
+      "current_revision_id": "ticket:4:1",
+      "indexed_data": {
+        "priority": "high",
+        "title": "D new"
+      },
+      "is_deleted": false,
+      "revisions": {
+        "ticket:4:1": {
+          "created_by": "erin",
+          "created_time": "2025-09-08T13:00:00",
+          "data": {
+            "address": null,
+            "due": null,
+            "payload": "",
+            "priority": "high",
+            "ref": null,
+            "score": 0.0,
+            "tags": [],
+            "title": "D new"
+          },
+          "data_hash": "xxh3_128:fa9876b1b119ec773addb8af5e63696d",
+          "parent_revision_id": null,
+          "status": "stable",
+          "uid": "266ff74a-ae15-483d-98de-9e5a48cb38aa"
+        }
+      },
+      "total_revision_count": 1,
+      "updated_by": "erin",
+      "updated_time": "2025-09-08T13:00:00"
+    }
+  }
+}

@@ -139,12 +139,18 @@ through the shim — fix that import and re-run.
 
 ---
 
-## 8. Schema migrations are unrelated
+## 8. Data migrations are covered elsewhere
 
-If you arrived here looking for *data* migration (i.e. evolving the
-`msgspec.Struct` shape across versions of your application), see the
-[Schema Migration guide](https://hychou0515.github.io/specstar/howto/migrations/)
-instead. This document only covers the package-name rename.
+This document only covers the package-name rename. If you arrived here for
+*data*:
+
+* **Coming from `autocrud` 0.4.x** — the storage format changed underneath
+  you and specstar cannot read a 0.4 data directory. Export with
+  `autocrud==0.4.6` and import with `SpecStar.load()`; the walkthrough is
+  [Upgrading from autocrud 0.4.x](https://hychou0515.github.io/specstar/guides/upgrade-from-0.4/).
+* **Evolving the `msgspec.Struct` shape** across versions of your own
+  application — see the
+  [Schema Migration guide](https://hychou0515.github.io/specstar/howto/migrations/).
 
 ---
 

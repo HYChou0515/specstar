@@ -212,6 +212,7 @@ plugins:
                 - guides/storage.md
                 - guides/performance.md
                 - guides/from-demo-to-production.md
+                - guides/upgrade-from-0.4.md
                 - guides/upgrade-0.9.md
                 - guides/upgrade-0.10.md
                 - guides/upgrade-0.11.md

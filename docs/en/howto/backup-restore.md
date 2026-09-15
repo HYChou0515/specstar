@@ -123,6 +123,10 @@ Treat restore validation as part of the process, not as an optional extra step.
 
 ## Operational advice
 
+- large archives stream on both ends — `dump()` writes record by record and
+  `load()` writes in batches (`batch_size` / `batch_bytes`), so memory is
+  bounded by the batch, not by the archive; for multi-GB files prefer
+  `spec.load(open(...))` on the host over an HTTP upload
 - test restore regularly instead of assuming the archive is enough
 - choose `overwrite` carefully in shared environments
 - use per-model export when you want a safer, narrower migration scope
