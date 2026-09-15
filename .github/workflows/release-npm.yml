@@ -4,13 +4,17 @@ name: Release (npm)
 # `specstar-web-generator` CLI) to npm. The Python distribution is a separate
 # artefact on its own `v*` stream — see release-pypi.yml.
 #
-# ONE-TIME BOOTSTRAP: npm cannot publish a package's *first* version over
-# OIDC. A trusted publisher is configured on the package's settings page,
-# which only exists once the package does (npm/cli#8544). So `0.3.4` has to
-# be published once from a workstation — `make -C web bootstrap-publish` —
-# and the trusted publisher enabled afterwards. Until that is done, this
-# workflow will fail at the publish step with a 404/ENEEDAUTH (npm/cli#9088
-# reports missing trusted-publishing diagnostics as a plain 404).
+# The bootstrap is DONE: 0.3.4 was published by hand on 2026-07-28, because
+# npm cannot publish a package's *first* version over OIDC — the trusted
+# publisher is configured on a settings page that only exists once the
+# package does (npm/cli#8544). Kept here because it explains why
+# `make -C web bootstrap-publish` exists and why it must never be used again.
+#
+# Note for anyone debugging a failure here: npm reports every unauthorized
+# publish as a bare 404 "not found" (npm/cli#9088), so a 404 means "npm did
+# not accept who you are", not "the package is missing". Check the trusted
+# publisher's repo/workflow/environment tuple, and check that nothing has
+# written npm credentials into an .npmrc — see the guard below.
 on:
   push:
     tags:
@@ -66,12 +70,56 @@ jobs:
         with:
           version: 10
 
+      # `registry-url` is kept (npm's own trusted-publishing example sets it,
+      # and it is what pins the registry npm authenticates against) — but the
+      # .npmrc it generates has to be repaired before publishing, see below.
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
           cache: pnpm
           cache-dependency-path: web/generator/pnpm-lock.yaml
+
+      # setup-node writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`
+      # and defaults NODE_AUTH_TOKEN to the literal placeholder
+      # `XXXXX-XXXXX-XXXXX-XXXXX`. npm then authenticates with that junk bearer
+      # token instead of exchanging its OIDC token, and the registry answers the
+      # unauthorized PUT with a bare 404 — which reads as "no such package" and
+      # sends you hunting for a permission problem that does not exist. That is
+      # exactly how web-v0.3.5 failed. actions/setup-node#1551.
+      #
+      # Strip the line rather than dropping `registry-url`: this is the
+      # workaround the issue thread settled on, and it keeps the registry
+      # explicitly configured.
+      - name: Remove the placeholder auth line setup-node writes
+        run: |
+          for f in "$NPM_CONFIG_USERCONFIG" "$HOME/.npmrc"; do
+            [ -n "$f" ] && [ -f "$f" ] || continue
+            sed -i '/_authToken/d' "$f"
+            echo "cleaned $f"
+          done
+
+      # Belt and braces: if anything else in the toolchain (a future
+      # setup-node, pnpm, a cached runner image) leaves an auth line behind,
+      # npm would silently prefer it over OIDC and fail as another opaque
+      # 404. Fail loudly here instead, where the message can say why.
+      # Checks the npmrc FILES, not `npm config list` — that command hides
+      # auth values, so it reports nothing even when a token is configured
+      # and would make this guard permanently green.
+      - name: No stored credentials may pre-empt OIDC
+        run: |
+          found=""
+          for f in "$NPM_CONFIG_USERCONFIG" "$HOME/.npmrc" ".npmrc" "web/generator/.npmrc"; do
+            [ -n "$f" ] && [ -f "$f" ] || continue
+            if grep -qE '_authToken|^\s*_auth\s*=' "$f"; then
+              found="$found $f"
+            fi
+          done
+          if [ -n "$found" ]; then
+            echo "::error::stored npm credentials will pre-empt trusted publishing (found in:$found) — the sed step above should have removed them"
+            exit 1
+          fi
+          echo "no stored npm credentials — OIDC will be used"
 
       # Trusted publishing needs npm >= 11.5.1 (Node 24 already ships an
       # 11.x, but the floor is what matters and a stale npm fails as an
@@ -80,6 +128,24 @@ jobs:
         run: |
           npm install -g npm@^11.5.1
           npm --version
+
+      # npm reports every trusted-publishing failure as ENEEDAUTH or 404
+      # (npm/cli#9088), which cannot distinguish "GitHub issued us no OIDC
+      # token" from "npm never asked for one" from "npm asked and npmjs.com
+      # has no matching trusted publisher". Print the one fact that splits
+      # those apart. Booleans only — never the token itself.
+      - name: OIDC preconditions
+        run: |
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "id-token permission: GRANTED (runner can mint an OIDC token)"
+          else
+            echo "::error::id-token permission MISSING — the job needs permissions.id-token: write"
+            exit 1
+          fi
+          echo "repository:  ${{ github.repository }}"
+          echo "workflow:    $(basename "$(echo '${{ github.workflow_ref }}' | cut -d@ -f1)")"
+          echo "environment: npm"
+          echo "These three must match the trusted publisher on npmjs.com exactly."
 
       - name: Install dependencies
         working-directory: web/generator

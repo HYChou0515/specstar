@@ -42,7 +42,8 @@ help:
 	@echo "  make sync-templates    - 把 app/ 同步進 generator/templates/base"
 	@echo "  make check-templates   - 驗證 templates 已同步（不寫入）"
 	@echo "  make release           - 打 web-vX.Y.Z tag + push；上傳由 CI 執行"
-	@echo "  make bootstrap-publish - 一次性：首發到 npm（OIDC 發不了第一版）"
+	@echo "  make trust             - 一次性：註冊 npm trusted publisher（要 2FA）"
+	@echo "  make bootstrap-publish - 一次性：首發到 npm（已完成，勿再用）"
 	@echo ""
 	@echo "其他："
 	@echo "  make clean        - 清理生成的檔案"
@@ -240,15 +241,31 @@ release: check-templates
 	echo "✅ 已 push tag web-v$$v"; \
 	echo "   追蹤：https://github.com/HYChou0515/specstar/actions/workflows/release-npm.yml"
 
+# 一次性：把這個 repo 註冊成 npm 的 trusted publisher，讓 CI 免 token 發布。
+#
+# 用 CLI 而不是網頁設定頁；三元組必須跟 release-npm.yml 逐字相同，所以寫死
+# 在這裡而不是靠人手打。npm 規定 trust 操作要過**帳號層級 2FA**，且明文不
+# 接受 bypass-2FA 的 granular token，所以它會跳出 one-time password 提示，
+# 只能由維護者本人完成 —— 這是憑證邊界，不是可以自動化的步驟。
+#
+# 本機 npm 若低於 11 沒有 `trust` 子指令，故走 npx，不動全域安裝。
+# 先看會送出什麼：make trust DRY_RUN=1
+.PHONY: trust
+trust:
+	@echo "🔐 註冊 npm trusted publisher（會要求輸入 2FA 六位數）..."
+	npx -y npm@11 trust github specstar-web-generator \
+		--file release-npm.yml \
+		--repo HYChou0515/specstar \
+		--env npm \
+		--allow-publish $(if $(DRY_RUN),--dry-run)
+	@echo "✅ 完成後，發 web-vX.Y.Z tag 即可全自動發布（make release）"
+
 # 一次性的 bootstrap：把 generator 的「第一版」發到 npm。
 #
 # npm 不能用 OIDC 發套件的第一版 —— trusted publisher 是在套件設定頁設定
-# 的，而設定頁要等套件存在才有（npm/cli#8544）。所以 0.3.4 必須從工作站手
-# 動發一次，之後到 npmjs.com 開 trusted publisher，往後就只走 `make
-# release` 推 tag → CI。需要先 `npm login`。
-#
-# 這不是 `make release` 的替代路徑，是它的前置條件；bootstrap 完成後不該
-# 再用。
+# 的，而設定頁要等套件存在才有（npm/cli#8544）。0.3.4 已於 2026-07-28 用這
+# 個 target 發過，**不該再用**；往後一律 `make trust`（一次）+ `make
+# release`（每次）走 CI。需要先 `npm login`。
 .PHONY: bootstrap-publish
 bootstrap-publish: style sync-templates build-gen
 	@echo "🚀 首次發布 generator 到 npm（bootstrap，只做一次）..."

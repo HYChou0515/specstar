@@ -292,13 +292,44 @@ tag 指到的 commit，所以這道檢查是把那個步驟換成一個會紅的
 
 ### 一次性設定
 
-- **PyPI**：在專案設定新增 Trusted Publisher（repo `HYChou0515/specstar`、
-  workflow `release-pypi.yml`、environment `pypi`）。
-- **npm**：npm **不能用 OIDC 發套件的第一版**（trusted publisher 要在套件設
-  定頁設定，而設定頁得等套件存在，見 npm/cli#8544）。首次請執行
-  `make -C web bootstrap-publish`（需先 `npm login`），發完再到 npmjs.com 開
-  trusted publisher（repo、workflow `release-npm.yml`、environment `npm`），
-  之後就只走 `make -C web release`。
+**PyPI** —— 在專案設定新增 Trusted Publisher（repo `HYChou0515/specstar`、
+workflow `release-pypi.yml`、environment `pypi`）。
+
+**npm** —— 兩步，且順序不能反。
+
+1. npm **不能用 OIDC 發套件的第一版**：trusted publisher 要在套件設定頁設
+   定，而設定頁得等套件存在（npm/cli#8544）。`0.3.4` 已於 2026-07-28 用
+   `make -C web bootstrap-publish` 手動發過，這一步**不需要再做**。
+2. 註冊 trusted publisher。用 CLI 就好，不必開網頁：
+
+   ```bash
+   npx -y npm@11 trust github specstar-web-generator \
+     --file release-npm.yml --repo HYChou0515/specstar \
+     --env npm --allow-publish
+   ```
+
+   npm 規定 trust 操作必須通過**帳號層級 2FA**，並且明文不接受
+   bypass-2FA 的 granular token —— 所以這行只能由維護者本人跑，會跳出
+   one-time password 提示。先 `--dry-run` 可以確認參數。
+
+### 排查：npm 發布失敗
+
+npm 把**所有**未通過認證的 publish 都回報成 `E404 Not Found` 或
+`ENEEDAUTH`（npm/cli#9088）。看到 404 不要去查「套件不存在」或權限，那是
+假線索 —— 它的意思是「npm 不接受你的身分」。依序看：
+
+- workflow 的 **OIDC preconditions** 步驟有沒有印出 `id-token permission:
+  GRANTED`。沒有 → job 少了 `permissions: id-token: write`。
+- **No stored credentials may pre-empt OIDC** 有沒有紅。紅了表示有東西把
+  憑證寫進 `.npmrc`，npm 會**優先用它而完全不去做 OIDC 交換**。最常見的兇
+  手是 `actions/setup-node` 的 `registry-url:` —— 它會寫入
+  `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` 並把
+  `NODE_AUTH_TOKEN` 預設成字面字串 `XXXXX-XXXXX-XXXXX-XXXXX`
+  （actions/setup-node#1551）。workflow 裡那道 `sed '/_authToken/d'` 就是
+  為此存在，**不要拿掉**。
+- 以上都綠但仍 `ENEEDAUTH` → npmjs.com 上沒有相符的 trusted publisher，回
+  上面第 2 步。三元組（repository / workflow 檔名 / environment）必須逐字
+  相同，workflow 只填檔名不含路徑。
 
 ## 授權
 
