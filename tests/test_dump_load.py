@@ -415,3 +415,27 @@ def test_a_resource_without_its_current_revision_is_flagged(
     assert any("dump user: 1/" in m for m in caplog.messages)
     assert any("dump user: done" in m and "1 skipped" in m for m in caplog.messages)
     assert any(orphan.resource_id in m and "skipping" in m for m in caplog.messages)
+
+
+def test_a_running_dump_does_not_block_live_writers(tmp_path, make_crud):
+    """The export runs against a live 0.4.x service. On SQLite (rollback
+    journal) a SELECT cursor left open while revisions are read from disk
+    holds a SHARED lock for the whole pass and every commit in the live
+    service fails with 'database is locked'. The walk must not do that."""
+    src = make_crud(tmp_path / "src", User)
+    users = src.get_resource_manager(User)
+    with users.meta_provide("alice", T0):
+        ids = [users.create(User(name=f"u{i}", age=i)).resource_id for i in range(20)]
+
+    records = src.get_resource_manager(User).dump()  # lazy: we are "mid-export"
+    for _ in range(3):
+        next(records)
+    for _ in range(8):  # a few revisions in, files being read
+        next(records)
+
+    # the live service, on its own connection, must still be able to commit
+    live = make_crud(tmp_path / "src", User).get_resource_manager(User)
+    with live.meta_provide("live", T0 + dt.timedelta(hours=1)):
+        info = live.update(ids[0], User(name="written while dumping", age=99))
+    assert info.revision_id.endswith(":2")
+    assert len(list(records)) > 0  # and the export still runs to completion

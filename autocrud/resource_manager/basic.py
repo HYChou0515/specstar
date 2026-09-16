@@ -829,6 +829,16 @@ class IStorage(ABC, Generic[T]):
         across storage and retrieval operations.
         """
 
+    def list_resource_ids(self) -> list[str]:
+        """Every resource id, materialised.
+
+        Used by exports that then read each resource's files: holding a
+        streaming cursor open across that I/O keeps a SQLite SHARED lock for
+        the whole pass and blocks a live service's commits. Backends that
+        can list ids cheaply should override this.
+        """
+        return [meta.resource_id for meta in self.dump_meta()]
+
     @abstractmethod
     def dump_meta(self) -> Generator[ResourceMeta]:
         """Export all resource metadata for backup or migration.

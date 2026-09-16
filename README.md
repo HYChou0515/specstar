@@ -6,9 +6,10 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-compatible-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **0.4.7 — 0.4.x 只剩一個用途：把資料搬到 [specstar](https://pypi.org/project/specstar/)。**
+> **0.4.8 — 0.4.x 只剩一個用途：把資料搬到 [specstar](https://pypi.org/project/specstar/)。**
 > `AutoCRUD.dump()` 在 0.4.0–0.4.5 一呼叫就 `TypeError`；0.4.6 修好並改成直接輸出 specstar 的 `.acbak` 備份格式；
-> 0.4.7 讓它遇到壞掉的 resource / revision 時**跳過並回報**，不再整個中斷，並會記錄進度：
+> 0.4.7 讓它遇到壞掉的 resource / revision 時**跳過並回報**，不再整個中斷，並會記錄進度；
+> 0.4.8 讓它可以對**線上正在跑的服務**直接匯出（不再拿著 SQLite 游標讀檔而把寫入卡住）：
 >
 > ```python
 > import logging; logging.basicConfig(level=logging.INFO)   # 看進度

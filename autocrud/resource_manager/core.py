@@ -212,6 +212,11 @@ class SimpleStorage(IStorage[T]):
     def dump_meta(self) -> Generator[ResourceMeta]:
         yield from self._meta_store.values()
 
+    def list_resource_ids(self) -> list[str]:
+        # Consumes the id cursor in one go (ids only, cheap) so no statement
+        # stays active while the caller reads revision files.
+        return list(self._meta_store)
+
     def dump_resource(self) -> Generator[Resource[T]]:
         for resource_id in self._resource_store.list_resources():
             for revision_id in self._resource_store.list_revisions(resource_id):
@@ -767,7 +772,7 @@ class ResourceManager(IResourceManager[T], Generic[T]):
             )
 
         started = time.monotonic()
-        for meta in self._dump_metas(query):
+        for meta in self._dump_metas(query, skip):
             try:
                 yield MetaRecord(
                     data=self.meta_serializer.encode(self._export_meta(meta))
@@ -780,7 +785,7 @@ class ResourceManager(IResourceManager[T], Generic[T]):
         # Second pass for the revisions, so the archive keeps metas first
         # without holding every meta in memory.
         seen = 0
-        for meta in self._dump_metas(query):
+        for meta in self._dump_metas(query, skip):
             seen += 1
             resource_id = meta.resource_id
             try:
@@ -843,18 +848,28 @@ class ResourceManager(IResourceManager[T], Generic[T]):
         )
 
     def _dump_metas(
-        self, query: ResourceMetaSearchQuery | None
+        self,
+        query: ResourceMetaSearchQuery | None,
+        skip: Callable[[str, str | None, BaseException], None],
     ) -> Iterable[ResourceMeta]:
-        if query is None:
-            return self.storage.dump_meta()
-        # A query selects *resources*; each hit is exported with its whole
-        # revision history so the meta and the history stay consistent (and
-        # re-importing it over an earlier full import is idempotent).
-        # limit/offset are paging concerns of the search API, not of an
-        # export, so they are overridden.
-        return self.storage.search(
-            msgspec.structs.replace(query, limit=2**31 - 1, offset=0)
-        )
+        """The resources to export, read so that no meta-store cursor stays
+        open while the caller does file I/O (a live SQLite writer would
+        otherwise wait on our SHARED lock for the whole pass)."""
+        if query is not None:
+            # A query selects *resources*; each hit is exported with its whole
+            # revision history so the meta and the history stay consistent
+            # (and re-importing it over an earlier full import is idempotent).
+            # limit/offset are paging concerns of the search API, not of an
+            # export, so they are overridden. search() materialises.
+            yield from self.storage.search(
+                msgspec.structs.replace(query, limit=2**31 - 1, offset=0)
+            )
+            return
+        for resource_id in self.storage.list_resource_ids():
+            try:
+                yield self.storage.get_meta(resource_id)  # one short statement each
+            except Exception as e:  # noqa: BLE001
+                skip(resource_id, None, e)
 
     @execute_with_events(
         (BeforeLoad, AfterLoad, OnSuccessLoad, OnFailureLoad),
