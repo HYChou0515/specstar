@@ -6,12 +6,15 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-compatible-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **0.4.6 — 這是 0.4.x 的最後一個版本，只做一件事：讓你把資料搬到 [specstar](https://pypi.org/project/specstar/)。**
-> `AutoCRUD.dump()` 在 0.4.0–0.4.5 一呼叫就 `TypeError`，0.4.6 修好並改成直接輸出 specstar 的 `.acbak` 備份格式：
+> **0.4.7 — 0.4.x 只剩一個用途：把資料搬到 [specstar](https://pypi.org/project/specstar/)。**
+> `AutoCRUD.dump()` 在 0.4.0–0.4.5 一呼叫就 `TypeError`；0.4.6 修好並改成直接輸出 specstar 的 `.acbak` 備份格式；
+> 0.4.7 讓它遇到壞掉的 resource / revision 時**跳過並回報**，不再整個中斷，並會記錄進度：
 >
 > ```python
+> import logging; logging.basicConfig(level=logging.INFO)   # 看進度
 > with open("backup.acbak", "wb") as f:
->     crud.dump(f)          # 之後在 specstar 上：spec.load(open("backup.acbak", "rb"))
+>     report = crud.dump(f)      # {model: DumpReport(resources, revisions, bytes, seconds, skipped=[...])}
+> # 之後在 specstar 上：spec.load(open("backup.acbak", "rb"))
 > ```
 >
 > 完整步驟見 [Upgrading from autocrud 0.4.x](https://hychou0515.github.io/specstar/guides/upgrade-from-0.4/)。

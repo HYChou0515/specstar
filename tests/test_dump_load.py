@@ -2,6 +2,8 @@
 
 import datetime as dt
 import io
+import logging
+import shutil
 from pathlib import Path
 
 import msgspec
@@ -348,3 +350,68 @@ def test_dump_query_ignores_the_default_page_size(tmp_path, make_crud):
     bio = io.BytesIO()
     src.dump(bio, query=ResourceMetaSearchQuery(created_time_start=T0))
     assert len(_section_ids(bio.getvalue())) == 25
+
+
+def test_a_broken_revision_is_skipped_and_reported_not_fatal(tmp_path, make_crud):
+    src = make_crud(tmp_path / "src", User)
+    users = src.get_resource_manager(User)
+    with users.meta_provide("alice", T0):
+        ok = users.create(User(name="ok", age=1))
+        broken = users.create(User(name="broken", age=2))
+    with users.meta_provide("alice", T0 + dt.timedelta(minutes=1)):
+        broken2 = users.update(broken.resource_id, User(name="broken v2", age=3))
+    # corrupt the store: revision 1's payload file vanishes, revision 2's is garbage
+    data_dir = tmp_path / "src" / "user" / "data" / broken.resource_id
+    (data_dir / f"{broken.revision_id}.data").unlink()
+    (data_dir / f"{broken2.revision_id}.data").write_bytes(b"{not json")
+
+    bio = io.BytesIO()
+    report = src.dump(bio)  # default: skip and keep going
+
+    exported = _section_ids(bio.getvalue())
+    assert exported[ok.resource_id] == [ok.revision_id]
+    assert broken.resource_id in exported  # its meta is still exported
+    assert exported[broken.resource_id] == []  # ...with no usable revision
+    skipped = report["user"].skipped
+    assert {(s.resource_id, s.revision_id) for s in skipped} == {
+        (broken.resource_id, broken.revision_id),
+        (broken.resource_id, broken2.revision_id),
+    }
+    assert all(s.error for s in skipped)
+    assert report["user"].resources == 2 and report["user"].revisions == 1
+
+    # and the archive is still a valid one the other side can load
+    dst = make_crud(tmp_path / "dst", User)
+    dst.load(io.BytesIO(bio.getvalue()))
+    assert dst.get_resource_manager(User).get(ok.resource_id).data.name == "ok"
+
+    # on_error="raise" aborts on whichever broken revision comes first
+    with pytest.raises((FileNotFoundError, msgspec.DecodeError)):
+        src.dump(io.BytesIO(), on_error="raise")
+
+
+def test_a_resource_without_its_current_revision_is_flagged(
+    tmp_path, make_crud, caplog
+):
+    src = make_crud(tmp_path / "src", User)
+    users = src.get_resource_manager(User)
+    with users.meta_provide("alice", T0):
+        ok = users.create(User(name="ok", age=1))
+        orphan = users.create(User(name="orphan", age=2))
+    shutil.rmtree(
+        tmp_path / "src" / "user" / "data" / orphan.resource_id
+    )  # meta row survives
+
+    with caplog.at_level(logging.INFO, logger="autocrud"):
+        report = src.dump(io.BytesIO(), log_every=1)
+
+    flagged = report["user"].skipped
+    assert [(s.resource_id, s.revision_id) for s in flagged] == [
+        (orphan.resource_id, orphan.revision_id)
+    ]
+    assert "current revision" in flagged[0].error
+    assert report["user"].revisions == 1
+    # progress + summary lines are there for a long export to be watched
+    assert any("dump user: 1/" in m for m in caplog.messages)
+    assert any("dump user: done" in m and "1 skipped" in m for m in caplog.messages)
+    assert any(orphan.resource_id in m and "skipping" in m for m in caplog.messages)

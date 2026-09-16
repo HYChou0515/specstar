@@ -41,7 +41,7 @@ from autocrud.resource_manager.basic import (
     Encoding,
     IStorage,
 )
-from autocrud.resource_manager.core import ResourceManager
+from autocrud.resource_manager.core import DumpReport, ResourceManager
 from autocrud.resource_manager.dump_format import (
     DumpStreamReader,
     DumpStreamWriter,
@@ -508,7 +508,9 @@ class AutoCRUD:
         *,
         encoding: Encoding | str = Encoding.json,
         query: ResourceMetaSearchQuery | None = None,
-    ) -> None:
+        on_error: Literal["skip", "raise"] = "skip",
+        log_every: int = 1000,
+    ) -> dict[str, DumpReport]:
         """Export every model's resources as a specstar ``.acbak`` archive.
 
         The stream is the ``specstar`` v2 backup format (see
@@ -528,6 +530,18 @@ class AutoCRUD:
                 model. Selects *resources* (e.g. ``updated_time_start=`` for
                 "touched since"); each hit is exported with its complete
                 revision history. ``limit`` / ``offset`` are ignored.
+            on_error: ``"skip"`` (default) — a resource or revision that
+                cannot be read or encoded is left out, logged as a warning
+                and listed in the returned report; the export continues.
+                ``"raise"`` — abort on the first failure.
+            log_every: Log progress (INFO) every this many resources per
+                model; ``0`` disables. Enable with
+                ``logging.basicConfig(level=logging.INFO)``.
+
+        Returns:
+            ``{model_name: DumpReport}`` — resources / revisions / bytes
+            exported, seconds taken and the ``skipped`` items. Check
+            ``report[m].skipped`` before trusting an archive as complete.
 
         Example:
             ```python
@@ -550,12 +564,21 @@ class AutoCRUD:
         """
         writer = DumpStreamWriter(bio)
         writer.write(HeaderRecord())
+        reports: dict[str, DumpReport] = {}
         for model_name, mgr in self.resource_managers.items():
+            report = reports[model_name] = DumpReport()
             writer.write(ModelStartRecord(model_name=model_name))
-            for record in mgr.dump(encoding=Encoding(encoding), query=query):
+            for record in mgr.dump(
+                encoding=Encoding(encoding),
+                query=query,
+                on_error=on_error,
+                report=report,
+                log_every=log_every,
+            ):
                 writer.write(record)
             writer.write(ModelEndRecord(model_name=model_name))
         writer.write(EofRecord())
+        return reports
 
     def load(self, bio: IO[bytes]) -> None:
         """Import resources from an archive written by :meth:`dump`.

@@ -1,5 +1,7 @@
 import datetime as dt
-from collections.abc import Callable, Generator, Sequence
+import logging
+import time
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager, suppress
 from functools import cached_property, wraps
 import traceback
@@ -7,6 +9,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
+    Literal,
     NamedTuple,
     TypeVar,
     get_args,
@@ -108,6 +111,7 @@ from autocrud.resource_manager.data_converter import DataConverter
 from autocrud.resource_manager.dump_format import MetaRecord, RevisionRecord
 from autocrud.util.naming import NameConverter, NamingFormat
 
+logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
@@ -129,6 +133,24 @@ def _get_type_name(resource_type) -> str:
 
     # 後備方案
     return str(resource_type).replace(" ", "").replace("|", "Or")
+
+
+class SkippedItem(Struct):
+    """One resource / revision ``dump()`` could not export."""
+
+    resource_id: str
+    revision_id: str | None
+    error: str
+
+
+class DumpReport(Struct):
+    """What ``dump()`` exported for one model, and what it had to skip."""
+
+    resources: int = 0
+    revisions: int = 0
+    bytes: int = 0
+    seconds: float = 0.0
+    skipped: list[SkippedItem] = []
 
 
 class _ExportResourceMeta(ResourceMeta, kw_only=True):
@@ -694,49 +716,145 @@ class ResourceManager(IResourceManager[T], Generic[T]):
     @execute_with_events(
         (BeforeDump, AfterDump, OnSuccessDump, OnFailureDump),
         "result",
-        inputs={"encoding": UNSET, "query": UNSET},
+        inputs={
+            "encoding": UNSET,
+            "query": UNSET,
+            "on_error": UNSET,
+            "report": UNSET,
+            "log_every": UNSET,
+        },
     )
     def dump(
         self,
         *,
         encoding: Encoding = Encoding.json,
         query: ResourceMetaSearchQuery | None = None,
+        on_error: Literal["skip", "raise"] = "skip",
+        report: "DumpReport | None" = None,
+        log_every: int = 1000,
     ) -> Generator[MetaRecord | RevisionRecord]:
+        """Yield every resource's meta record, then every revision record.
+
+        Walks the *meta store* (optionally narrowed by ``query``) and, for
+        each resource, its revisions. A resource or revision that cannot be
+        read or encoded is skipped and recorded on ``report`` (default), or
+        aborts the export with ``on_error="raise"``. Progress is logged at
+        INFO every ``log_every`` resources.
+        """
+        if report is None:
+            report = DumpReport()
         payload_encoder = MsgspecSerializer(
             encoding=encoding, resource_type=self.resource_type
         )
-        if query is None:
-            metas = self.storage.dump_meta()
-            resources = self.storage.dump_resource()
-        else:
-            # A query selects *resources*; each hit is exported with its whole
-            # revision history so the meta and the history stay consistent
-            # (and re-importing it over an earlier full import is idempotent).
-            # limit/offset are paging concerns of the search API, not of an
-            # export, so they are overridden.
-            hits = self.storage.search(
-                msgspec.structs.replace(query, limit=2**31 - 1, offset=0)
-            )
-            metas = iter(hits)
-            resources = (
-                self.storage.get_resource_revision(meta.resource_id, revision_id)
-                for meta in hits
-                for revision_id in self.storage.list_revisions(meta.resource_id)
-            )
-        for meta in metas:
-            yield MetaRecord(data=self.meta_serializer.encode(self._export_meta(meta)))
-        for resource in resources:
-            raw_data = payload_encoder.encode(resource.data)
-            info = resource.info
-            # The hash is defined over the stored bytes; re-deriving it keeps it
-            # true whether the target encoding matches the store's or not (same
-            # encoding -> same deterministic bytes -> same hash as before).
-            info.data_hash = f"xxh3_128:{xxh3_128_hexdigest(raw_data)}"
-            yield RevisionRecord(
-                data=self.resource_serializer.encode(
-                    RawResource(info=info, raw_data=raw_data)
+
+        def skip(resource_id: str, revision_id: str | None, exc: BaseException):
+            if on_error == "raise":
+                raise exc
+            report.skipped.append(
+                SkippedItem(
+                    resource_id=resource_id,
+                    revision_id=revision_id,
+                    error=f"{type(exc).__name__}: {exc}",
                 )
             )
+            logger.warning(
+                "dump %s: skipping %s%s — %s: %s",
+                self.resource_name,
+                resource_id,
+                f" revision {revision_id}" if revision_id else "",
+                type(exc).__name__,
+                exc,
+            )
+
+        started = time.monotonic()
+        for meta in self._dump_metas(query):
+            try:
+                yield MetaRecord(
+                    data=self.meta_serializer.encode(self._export_meta(meta))
+                )
+            except Exception as e:  # noqa: BLE001 — every failure is reportable
+                skip(meta.resource_id, None, e)
+                continue
+            report.resources += 1
+
+        # Second pass for the revisions, so the archive keeps metas first
+        # without holding every meta in memory.
+        seen = 0
+        for meta in self._dump_metas(query):
+            seen += 1
+            resource_id = meta.resource_id
+            try:
+                revision_ids = self.storage.list_revisions(resource_id)
+            except Exception as e:  # noqa: BLE001
+                skip(resource_id, None, e)
+                continue
+            if meta.current_revision_id not in revision_ids:
+                # The meta row outlived its data (or never had any): the
+                # importer would get a resource whose current revision does
+                # not exist. Export what is there, but flag it.
+                skip(
+                    resource_id,
+                    meta.current_revision_id,
+                    LookupError("current revision has no stored data"),
+                )
+            for revision_id in revision_ids:
+                try:
+                    resource = self.storage.get_resource_revision(
+                        resource_id, revision_id
+                    )
+                    raw_data = payload_encoder.encode(resource.data)
+                    info = resource.info
+                    # The hash is defined over the stored bytes; re-deriving it
+                    # keeps it true whether the target encoding matches the
+                    # store's or not (same encoding -> same deterministic bytes
+                    # -> same hash as before).
+                    info.data_hash = f"xxh3_128:{xxh3_128_hexdigest(raw_data)}"
+                    record = RevisionRecord(
+                        data=self.resource_serializer.encode(
+                            RawResource(info=info, raw_data=raw_data)
+                        )
+                    )
+                except Exception as e:  # noqa: BLE001
+                    skip(resource_id, revision_id, e)
+                    continue
+                report.revisions += 1
+                report.bytes += len(record.data)
+                yield record
+            if log_every and seen % log_every == 0:
+                logger.info(
+                    "dump %s: %d/%d resources, %d revisions, %.1f MiB, %d skipped, %.0fs",
+                    self.resource_name,
+                    seen,
+                    report.resources,
+                    report.revisions,
+                    report.bytes / 2**20,
+                    len(report.skipped),
+                    time.monotonic() - started,
+                )
+        report.seconds = time.monotonic() - started
+        logger.info(
+            "dump %s: done — %d resources, %d revisions, %.1f MiB, %d skipped, %.0fs",
+            self.resource_name,
+            report.resources,
+            report.revisions,
+            report.bytes / 2**20,
+            len(report.skipped),
+            report.seconds,
+        )
+
+    def _dump_metas(
+        self, query: ResourceMetaSearchQuery | None
+    ) -> Iterable[ResourceMeta]:
+        if query is None:
+            return self.storage.dump_meta()
+        # A query selects *resources*; each hit is exported with its whole
+        # revision history so the meta and the history stay consistent (and
+        # re-importing it over an earlier full import is idempotent).
+        # limit/offset are paging concerns of the search API, not of an
+        # export, so they are overridden.
+        return self.storage.search(
+            msgspec.structs.replace(query, limit=2**31 - 1, offset=0)
+        )
 
     @execute_with_events(
         (BeforeLoad, AfterLoad, OnSuccessLoad, OnFailureLoad),
