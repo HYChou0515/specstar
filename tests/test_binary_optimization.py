@@ -508,3 +508,79 @@ class TestGenericStructBinaryProcess:
         assert len(tracker_store.puts) == 1
         assert processed.inner.content.file_id == "mock_file_id"
         assert processed.inner.content.data is UNSET
+
+
+# ======================================================================
+# The compiled-processor cache must not claim a type needs processing
+# ======================================================================
+
+
+class _Plain(Struct):
+    a: str = ""
+    b: str = ""
+
+
+class _Leaf(Struct):
+    f: Optional[Binary] = None
+
+
+class _Nested(Struct):
+    x: Optional[_Leaf] = None
+
+
+class _SameTypeTwiceThenBlob(Struct):
+    p1: Optional[_Plain] = None
+    p2: Optional[_Plain] = None
+    leaf: Optional[_Leaf] = None
+
+
+class _Recursive(Struct):
+    child: Optional["_Recursive"] = None
+    f: Optional[Binary] = None
+
+
+class _ListOfBlob(Struct):
+    items: List[Binary] = []
+
+
+class _DictOfBlob(Struct):
+    m: Dict[str, Binary] = {}
+
+
+class TestCollectorGate:
+    """``_collector is not None`` must mean "this type can carry a Binary".
+
+    ``_compile`` pre-registers a truthy stub in its cache so a recursive
+    type can refer to itself mid-compilation, and used to leave the stub
+    behind when the compilation concluded that nothing needed processing.
+    The *second* lookup of that type then returned the stub, so any
+    struct with two fields of the same type claimed it needed processing.
+    Behaviour was unaffected — the stub is the identity function — but
+    every truthiness test on the result was wrong, and a dump uses one to
+    decide whether a model can hold an attachment at all.
+    """
+
+    @pytest.mark.parametrize(
+        "type_hint,can_hold_a_blob",
+        [
+            (_Plain, False),
+            (_Leaf, True),
+            (_Nested, True),
+            (_SameTypeTwiceThenBlob, True),
+            (_Recursive, True),
+            (_ListOfBlob, True),
+            (_DictOfBlob, True),
+            (Optional[_Leaf], True),
+        ],
+    )
+    def test_the_gate_answers_the_question_it_is_asked(
+        self, type_hint: Any, can_hold_a_blob: bool
+    ):
+        collector = BinaryProcessor(type_hint)._collector
+
+        assert (collector is not None) is can_hold_a_blob
+
+    def test_a_repeated_blob_free_field_does_not_flip_the_answer(self):
+        """The exact shape that used to break it: one type, seen twice."""
+        assert BinaryProcessor(_Plain)._collector is None
+        assert BinaryProcessor(_SameTypeTwiceThenBlob)._collector is not None
