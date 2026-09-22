@@ -406,6 +406,12 @@ class SpecStar:
         self.model_naming = "kebab"
         self.message_queue_factory = None
         self.route_templates: list[IRouteTemplate] = []
+        # The provider the generated routes resolve ``current_user`` /
+        # ``current_time`` through. Kept here as well as on each route
+        # template because the global ``/_backup/*`` routes are built by
+        # SpecStar itself and have no template to borrow it from — which
+        # is how they ended up binding no identity at all.
+        self._dependency_provider = DependencyProvider()
         self.permission_checker = AllowAll()
         self.event_handlers = None
         self.default_encoding = Encoding.json
@@ -623,6 +629,7 @@ class SpecStar:
                 if effective_default_user is not UNSET:
                     base_dp = dep_provider or DependencyProvider()
                     dep_provider = base_dp.with_default_user(effective_default_user)
+                self._dependency_provider = dep_provider or DependencyProvider()
 
                 for rt in [
                     CreateRouteTemplate,
@@ -3283,6 +3290,11 @@ class SpecStar:
         )
 
         specstar_ref = self  # closure over self
+        # Bind the request's identity exactly as every generated route
+        # template does. Without this the permission check saw the
+        # spec-level default_user on every call, so a deployment with real
+        # authentication had two open doors (#450 S4).
+        deps = self._dependency_provider
 
         @router.get(
             "/_backup/export",
@@ -3309,6 +3321,8 @@ class SpecStar:
                     "models are exported."
                 ),
             ),
+            current_user: str = Depends(deps.get_user),
+            current_time: dt.datetime = Depends(deps.get_now),
         ):
             model_queries: dict[str, Query | ResourceMetaSearchQuery | None] | None = (
                 None
@@ -3330,7 +3344,9 @@ class SpecStar:
                 # 500, which reads as "the library broke" and made the
                 # backup door look unguarded. Nothing is read from storage
                 # until the response starts pulling chunks.
-                chunks = specstar_ref.iter_dump(model_queries)
+                chunks = specstar_ref.iter_dump(
+                    model_queries, user=current_user, now=current_time
+                )
             except Exception as e:
                 raise to_http_exception(e)
             return StreamingResponse(
@@ -3358,6 +3374,8 @@ class SpecStar:
                 "overwrite",
                 description="Strategy: overwrite | skip | raise_error",
             ),
+            current_user: str = Depends(deps.get_user),
+            current_time: dt.datetime = Depends(deps.get_now),
         ) -> dict:
             try:
                 strategy = OnDuplicate(on_duplicate)
@@ -3375,7 +3393,12 @@ class SpecStar:
             # has to fit in memory here.
             await file.seek(0)
             try:
-                stats = specstar_ref.load(file.file, on_duplicate=strategy)
+                stats = specstar_ref.load(
+                    file.file,
+                    on_duplicate=strategy,
+                    user=current_user,
+                    now=current_time,
+                )
             except Exception as e:
                 # ValueError (bad archive) still maps to 400 through the
                 # shared mapper; a denied load now maps to 403 instead of
@@ -3554,6 +3577,8 @@ class SpecStar:
         model_queries: dict[str, Query | ResourceMetaSearchQuery | None] | None = None,
         *,
         strict: bool = True,
+        user: str | UnsetType = UNSET,
+        now: dt.datetime | UnsetType = UNSET,
     ) -> dict[str, "DumpStats"]:
         """Export resources to a streaming msgpack archive.
 
@@ -3569,6 +3594,10 @@ class SpecStar:
                 decoded — raises :class:`DumpIncompleteError` rather than
                 being left out of the archive in silence. Pass *False* to
                 export what is readable and check the returned stats.
+            user: Who is asking. Defaults to the manager's context, which
+                for an HTTP caller means the route must pass the request's
+                user — the permission check reads this.
+            now: Timestamp for the operation context.
 
         Returns:
             Per-model :class:`DumpStats`: how many metas, revisions and
@@ -3589,7 +3618,9 @@ class SpecStar:
                 specstar.dump(f, model_queries={"user": QB.name == "Alice"})
         """
         stats: dict[str, DumpStats] = {}
-        for chunk in self.iter_dump(model_queries, strict=strict, stats=stats):
+        for chunk in self.iter_dump(
+            model_queries, strict=strict, stats=stats, user=user, now=now
+        ):
             bio.write(chunk)
         return stats
 
@@ -3599,6 +3630,8 @@ class SpecStar:
         *,
         strict: bool = True,
         stats: dict[str, "DumpStats"] | None = None,
+        user: str | UnsetType = UNSET,
+        now: dt.datetime | UnsetType = UNSET,
     ) -> Iterator[bytes]:
         """Produce the same archive as :meth:`dump`, as byte chunks.
 
@@ -3619,6 +3652,10 @@ class SpecStar:
             stats: Optional dict to fill with per-model
                 :class:`DumpStats` — the return value has nowhere to go
                 on a generator, so pass one in if you need the counts.
+            user: Who is asking; each model's ``dump`` is called inside
+                ``using(user, now)`` so the permission check sees the
+                request's caller rather than the spec-level default.
+            now: Timestamp for the operation context.
 
         Yields:
             Length-prefixed frames, in archive order.
@@ -3647,14 +3684,17 @@ class SpecStar:
                 )
             model_stats = DumpStats()
             stats[model_name] = model_stats
-            sections.append(
-                (
-                    model_name,
-                    self.resource_managers[model_name].dump(
-                        query=query, strict=strict, stats=model_stats
-                    ),
+            mgr = self.resource_managers[model_name]
+            # The context has to be entered around the CALL, which is
+            # where the permission check runs. The generator body executes
+            # later, outside it, and performs only internal reads.
+            with mgr.using(user, now):
+                sections.append(
+                    (
+                        model_name,
+                        mgr.dump(query=query, strict=strict, stats=model_stats),
+                    )
                 )
-            )
 
         return self._iter_dump_frames(sections)
 
@@ -3685,6 +3725,8 @@ class SpecStar:
         *,
         batch_size: int = 1000,
         batch_bytes: int = 64 * 1024 * 1024,
+        user: str | UnsetType = UNSET,
+        now: dt.datetime | UnsetType = UNSET,
     ) -> dict[str, "LoadStats"]:
         """Import resources from a streaming msgpack archive.
 
@@ -3704,6 +3746,10 @@ class SpecStar:
             batch_size: Records per write batch.
             batch_bytes: Payload bytes per write batch (blob-heavy archives
                 hit this bound first).
+            user: Who is asking; each batch is written inside
+                ``using(user, now)`` so the permission check sees the
+                request's caller rather than the spec-level default.
+            now: Timestamp for the operation context.
 
         Returns:
             Per-model load statistics: ``{model_name: LoadStats}``.
@@ -3754,13 +3800,14 @@ class SpecStar:
             if current_mgr is None or current_model is None:
                 return
             if meta_buf or rev_buf or blob_buf:
-                st = current_mgr.load_records_bulk(
-                    meta_buf,
-                    rev_buf,
-                    blob_buf,
-                    on_duplicate=on_duplicate,
-                    skipped_ids=skipped_ids,
-                )
+                with current_mgr.using(user, now):
+                    st = current_mgr.load_records_bulk(
+                        meta_buf,
+                        rev_buf,
+                        blob_buf,
+                        on_duplicate=on_duplicate,
+                        skipped_ids=skipped_ids,
+                    )
                 s = stats[current_model]
                 s.loaded += st.loaded
                 s.skipped += st.skipped

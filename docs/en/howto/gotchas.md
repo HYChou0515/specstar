@@ -343,16 +343,17 @@ the returned per-model `DumpStats` (`complete`, `skipped_blobs`,
 Cutting an archive at a record boundary leaves whole, decodable records, so
 nothing downstream used to notice: `load()` returned `loaded=0` without
 raising. It now requires the end-of-stream record and raises
-`ArchiveTruncatedError` (`400` on the import routes) if the stream ends early.
+`ArchiveTruncatedError` if the stream ends at a record boundary (a cut in the
+middle of a record is caught by the frame reader as a `ValueError`). Both are a
+`400` on the import routes.
 Loading is not transactional — batches already written stay written, and the
 error carries the counts that were applied.
 
-### The backup routes are permission-checked, but `access_scope` does not fence them
+### `access_scope` does not fence a backup
 
-`/_backup/*` and `/{model}/export|import` have no `Depends` of their own, but
-`dump` and `load` are permission-checked inside `ResourceManager` like every
-other action (`ResourceAction.dump` / `load`, grouped as
-`ResourceAction.backup`), and a refusal is a `403`. Two caveats: the default
+The backup routes are permission-checked against the request's user like every
+other route (`ResourceAction.dump` / `load`, grouped as
+`ResourceAction.backup`); a refusal is a `403`. Two caveats: the default
 checker is `AllowAll()`, so out of the box they are as open as everything else;
 and `access_scope` restricts reads and request-writes only — a user allowed to
 `dump` gets **every** row of that model, not the rows their scope would show.

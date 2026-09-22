@@ -153,6 +153,22 @@ class TestTruncatedArchiveOverHttp:
         assert response.status_code == 400
         assert "truncated" in response.json()["detail"].lower()
 
+    def test_per_model_import_rejects_an_archive_cut_mid_record(self):
+        """The ordinary "upload stopped early" shape.
+
+        A cut at a frame boundary is caught by the EofRecord check; a cut
+        inside a frame is caught by the reader, which raises a plain
+        ``ValueError``. The per-model route wrapped only ``StopIteration``
+        around its first read, so that one escaped as a 500 while the
+        global route already answered 400 for the same bytes.
+        """
+        archive = _archive(_seeded(5))
+        cut = archive[: len(archive) - 7]
+
+        for path in ("/item/import", "/_backup/import"):
+            response = _client(_spec()).post(path, files={"file": ("x.acbak", cut)})
+            assert response.status_code == 400, path
+
     def test_global_import_rejects_a_truncated_archive(self):
         truncated = _truncate_after_last_revision(_archive(_seeded(5)))
         client = _client(_spec())

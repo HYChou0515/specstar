@@ -122,11 +122,13 @@ for model, s in stats.items():
 
 **A load refuses a truncated archive.** Every archive ends with an
 end-of-stream record. If the bytes run out before it — a dump that died,
-a transfer that stopped, a strict failure part-way — `load()` raises
-`ArchiveTruncatedError` and the import routes answer `400`. Loading is not
-transactional, so batches already written stay written; the error carries
-the per-model counts that *were* applied, rather than pretending to undo
-them.
+a transfer that stopped, a strict failure part-way — the archive is
+refused: a cut at a record boundary raises `ArchiveTruncatedError`, a cut
+in the middle of a record is caught by the frame reader itself
+(`ValueError`), and both are a `400` on the import routes. Loading is not
+transactional, so batches already written stay written; the
+`ArchiveTruncatedError` carries the per-model counts that *were* applied,
+rather than pretending to undo them.
 
 This is what makes a strict dump safe to keep: the partial file it leaves
 behind cannot later be restored as though it were whole.
@@ -135,12 +137,11 @@ behind cannot later be restored as though it were whole.
 
 ## Who may run a backup
 
-The backup routes are **not** unauthenticated. `dump` and `load` are
-actions like any other (`ResourceAction.dump`, `ResourceAction.load`,
-grouped as `ResourceAction.backup`), checked by your
-`permission_checker` inside `ResourceManager` — so the check applies to
-every caller, including the HTTP routes, which have no `Depends` of their
-own. A refusal is a `403`.
+`dump` and `load` are actions like any other — `ResourceAction.dump`,
+`ResourceAction.load`, grouped as `ResourceAction.backup` — checked by
+your `permission_checker`. All four backup routes resolve the request's
+user through the same `DependencyProvider` as every other generated
+route, so the check is against the caller and a refusal is a `403`.
 
 Two things follow that are easy to get wrong:
 
@@ -153,6 +154,12 @@ Two things follow that are easy to get wrong:
   reads through storage directly. A user allowed to `dump` gets every row
   of that model, not the rows their scope would show them. Grant the
   backup actions to operators, not to end users.
+
+Calling the library directly, pass the user the same way:
+
+```python notest
+stats = spec.dump(open("backup.acbak", "wb"), user="operator")
+```
 
 ---
 
@@ -191,11 +198,12 @@ Treat restore validation as part of the process, not as an optional extra step.
 ## Operational advice
 
 - large archives stream on both ends — `dump()` writes record by record,
-  the export routes send frames as they are produced (via
-  `SpecStar.iter_dump()`, which is also the API to use when the
-  destination is a pipe or an uploader rather than a file), and `load()`
+  both export routes send frames as they are produced, and `load()`
   writes in batches (`batch_size` / `batch_bytes`), so memory is bounded
-  by the batch, not by the archive
+  by the batch, not by the archive. `SpecStar.iter_dump()` is the same
+  archive as an iterator of byte chunks (it is what `GET /_backup/export`
+  returns); use it when the destination is a pipe or an uploader rather
+  than a file
 - one blob is still one record, so peak memory is at least the size of the
   largest single attachment; for multi-GB files prefer
   `spec.load(open(...))` on the host over an HTTP upload

@@ -9,11 +9,20 @@ Two templates are provided:
   ``.acbak`` archive and loads it into the datastore.
 """
 
+import datetime as dt
 import io
 import textwrap
 from typing import IO, TypeVar
 
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 
 from specstar.crud.route_templates.basic import (
@@ -79,6 +88,8 @@ class ExportRouteTemplate(BaseRouteTemplate):
         async def export_model(
             request: Request,
             query_params: QueryInputs = Query(...),
+            current_user: str = Depends(self.deps.get_user),
+            current_time: dt.datetime = Depends(self.deps.get_now),
         ) -> StreamingResponse:
             from specstar.resource_manager.dump_format import (
                 EofRecord,
@@ -101,8 +112,11 @@ class ExportRouteTemplate(BaseRouteTemplate):
                 # function, so calling it runs the permission check even
                 # though the body is a generator — a refusal reaches here
                 # while the status code can still be set. An untranslated
-                # one left as a 500.
-                records = resource_manager.dump(query=query_for_dump)
+                # one left as a 500. The context must be entered around
+                # this CALL, not around the generator body, for the same
+                # reason: that is where the check runs.
+                with resource_manager.using(current_user, current_time):
+                    records = resource_manager.dump(query=query_for_dump)
             except Exception as e:
                 raise to_http_exception(e)
 
@@ -192,6 +206,8 @@ class ImportRouteTemplate(BaseRouteTemplate):
                 "overwrite",
                 description="Strategy: overwrite | skip | raise_error",
             ),
+            current_user: str = Depends(self.deps.get_user),
+            current_time: dt.datetime = Depends(self.deps.get_now),
         ) -> dict:
             from specstar.resource_manager.dump_format import (
                 BlobRecord,
@@ -238,6 +254,12 @@ class ImportRouteTemplate(BaseRouteTemplate):
                         "field or as a raw application/octet-stream body."
                     ),
                 )
+            except Exception as e:
+                # Only StopIteration was caught here, so a malformed or
+                # mid-frame stream — the ordinary "upload stopped early" —
+                # left the reader's ValueError to escape as a 500. The
+                # global route already answered 400 for the same input.
+                raise to_http_exception(e)
             if not isinstance(first, HeaderRecord):
                 raise HTTPException(
                     status_code=400,
@@ -259,56 +281,72 @@ class ImportRouteTemplate(BaseRouteTemplate):
             in_target_section = False
             saw_eof = False
 
-            for record in reader:
-                if isinstance(record, ModelStartRecord):
-                    in_target_section = record.model_name == model_name
+            # Every write below is permission-checked against this
+            # user; without the context it was the spec-level default.
+            with resource_manager.using(current_user, current_time):
+                try:
+                    for record in reader:
+                        if isinstance(record, ModelStartRecord):
+                            in_target_section = record.model_name == model_name
 
-                elif isinstance(record, ModelEndRecord):
-                    in_target_section = False
+                        elif isinstance(record, ModelEndRecord):
+                            in_target_section = False
 
-                elif isinstance(record, MetaRecord):
-                    if not in_target_section:
-                        continue
-                    total += 1
-                    try:
-                        ok = resource_manager.load_record(record, strategy)
-                    except Exception as e:
-                        # Was a blanket 409: it turned a permission refusal
-                        # into "conflict" and every storage failure into one
-                        # too. The shared mapper keeps the real conflicts at
-                        # 409 and sends a refusal to 403.
-                        raise to_http_exception(e)
-                    if ok:
-                        loaded += 1
-                    else:
-                        skipped += 1
-                        # Decode meta to track skipped resource ids so we
-                        # can skip their revisions too.
-                        meta = resource_manager.meta_serializer.decode(record.data)  # ty:ignore[unresolved-attribute]
-                        skipped_ids.add(meta.resource_id)
+                        elif isinstance(record, MetaRecord):
+                            if not in_target_section:
+                                continue
+                            total += 1
+                            try:
+                                ok = resource_manager.load_record(record, strategy)
+                            except Exception as e:
+                                # Was a blanket 409: it turned a permission refusal
+                                # into "conflict" and every storage failure into one
+                                # too. The shared mapper keeps the real conflicts at
+                                # 409 and sends a refusal to 403.
+                                raise to_http_exception(e)
+                            if ok:
+                                loaded += 1
+                            else:
+                                skipped += 1
+                                # Decode meta to track skipped resource ids so we
+                                # can skip their revisions too.
+                                meta = resource_manager.meta_serializer.decode(
+                                    record.data
+                                )  # ty:ignore[unresolved-attribute]
+                                skipped_ids.add(meta.resource_id)
 
-                elif isinstance(record, RevisionRecord):
-                    if not in_target_section:
-                        continue
-                    raw = resource_manager.resource_serializer.decode(record.data)  # ty:ignore[unresolved-attribute]
-                    if raw.info.resource_id in skipped_ids:
-                        continue
-                    try:
-                        resource_manager.load_record(record, strategy)
-                    except Exception as e:
-                        raise to_http_exception(e)
+                        elif isinstance(record, RevisionRecord):
+                            if not in_target_section:
+                                continue
+                            raw = resource_manager.resource_serializer.decode(
+                                record.data
+                            )  # ty:ignore[unresolved-attribute]
+                            if raw.info.resource_id in skipped_ids:
+                                continue
+                            try:
+                                resource_manager.load_record(record, strategy)
+                            except Exception as e:
+                                raise to_http_exception(e)
 
-                elif isinstance(record, BlobRecord):
-                    if not in_target_section:
-                        continue
-                    try:
-                        resource_manager.load_record(record, strategy)
-                    except Exception as e:
-                        raise to_http_exception(e)
+                        elif isinstance(record, BlobRecord):
+                            if not in_target_section:
+                                continue
+                            try:
+                                resource_manager.load_record(record, strategy)
+                            except Exception as e:
+                                raise to_http_exception(e)
 
-                elif isinstance(record, EofRecord):
-                    saw_eof = True
-                    break
+                        elif isinstance(record, EofRecord):
+                            saw_eof = True
+                            break
+                except Exception as e:
+                    # The frame reader raises a plain ValueError on a
+                    # stream cut inside a record — the ordinary
+                    # "upload stopped early". Only StopIteration on the
+                    # first read was handled, so that escaped as a 500
+                    # while the global route answered 400 for the same
+                    # bytes. One handler over the whole walk.
+                    raise to_http_exception(e)
 
             # No EofRecord means the upload was cut short. Every record
             # before the cut is already applied (load_record writes as it
