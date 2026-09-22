@@ -91,6 +91,7 @@ from specstar.resource_manager.storage_factory import (
 )
 from specstar.schema import Schema
 from specstar.types import (
+    ArchiveTruncatedError,
     IConstraintChecker,
     IMessageQueue,
     IMessageQueueFactory,
@@ -198,10 +199,10 @@ class LoadStats:
 
     __slots__ = ("loaded", "skipped", "total")
 
-    def __init__(self) -> None:
-        self.loaded = 0
-        self.skipped = 0
-        self.total = 0
+    def __init__(self, loaded: int = 0, skipped: int = 0, total: int = 0) -> None:
+        self.loaded = loaded
+        self.skipped = skipped
+        self.total = total
 
     def __repr__(self) -> str:
         return (
@@ -3651,6 +3652,7 @@ class SpecStar:
 
         current_model: str | None = None
         current_mgr = None
+        saw_eof = False
         # Record buffers for the batch being assembled, and the ids skipped
         # so far in this model section (a skipped resource's revisions may
         # arrive in a later batch and must be skipped too).
@@ -3720,6 +3722,15 @@ class SpecStar:
                 buffer(blob_buf, record, len(record.blob_data))
 
             elif isinstance(record, EofRecord):
+                saw_eof = True
                 break
 
+        # Flush whatever the last (possibly unterminated) section left
+        # buffered before judging the stream: those records are whole and
+        # decodable, and dropping them is the silent loss this guard exists
+        # to stop. A complete archive already flushed at its ModelEndRecord,
+        # so this is a no-op for it.
+        flush()
+        if not saw_eof:
+            raise ArchiveTruncatedError(stats)
         return stats

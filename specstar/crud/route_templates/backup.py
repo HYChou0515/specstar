@@ -23,6 +23,7 @@ from specstar.crud.route_templates.basic import (
 )
 from specstar.crud.route_templates.exception_handlers import to_http_exception
 from specstar.types import (
+    ArchiveTruncatedError,
     IResourceManager,
     OnDuplicate,
 )
@@ -244,6 +245,7 @@ class ImportRouteTemplate(BaseRouteTemplate):
             total = 0
             skipped_ids: set[str] = set()
             in_target_section = False
+            saw_eof = False
 
             for record in reader:
                 if isinstance(record, ModelStartRecord):
@@ -283,6 +285,21 @@ class ImportRouteTemplate(BaseRouteTemplate):
                     resource_manager.load_record(record, strategy)
 
                 elif isinstance(record, EofRecord):
+                    saw_eof = True
                     break
+
+            # No EofRecord means the upload was cut short. Every record
+            # before the cut is already applied (load_record writes as it
+            # reads), so this reports the truncation rather than undoing it
+            # — but it must report it: a silent 200 here is a restore that
+            # only looks complete.
+            if not saw_eof:
+                from specstar.crud.core import LoadStats
+
+                raise to_http_exception(
+                    ArchiveTruncatedError(
+                        {model_name: LoadStats(loaded, skipped, total)}
+                    )
+                )
 
             return {"loaded": loaded, "skipped": skipped, "total": total}

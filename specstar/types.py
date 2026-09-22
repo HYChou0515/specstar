@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from enum import Enum, Flag, StrEnum, auto
 from typing import (
@@ -2524,6 +2524,38 @@ class MissingOperationContextError(Exception):
                 f"Provide via explicit kwargs, using() scope, or manager defaults."
             )
         super().__init__(msg)
+
+
+class ArchiveTruncatedError(ValueError):
+    """A ``.acbak`` stream ended before its :class:`EofRecord` (issue #450).
+
+    The archive is incomplete — a dump that died part-way through, or a
+    transfer that stopped.  Cutting at a frame boundary leaves whole,
+    decodable records behind, so nothing downstream notices: the load used
+    to finish quietly and report ``loaded=0``, which is the one failure a
+    backup must never have.
+
+    Loading is **not** transactional.  Every batch written before the
+    stream ran out is already persisted, so this reports what was applied
+    rather than undoing it; ``stats`` carries the per-model counts as of
+    the moment the truncation was found.
+
+    Subclasses :class:`ValueError` so the archive-format handling that
+    already exists (``SpecStar.load`` documents ``ValueError``; the import
+    routes map it to ``400``) covers it without a second except clause.
+    """
+
+    def __init__(self, stats: Mapping[str, "LoadStats"] | None = None):
+        self.stats = dict(stats) if stats else {}
+        applied = ", ".join(
+            f"{model}: loaded={s.loaded} skipped={s.skipped}"
+            for model, s in sorted(self.stats.items())
+        )
+        super().__init__(
+            "Archive ended without an EofRecord, so it is truncated. "
+            "Records already written were NOT rolled back"
+            + (f" ({applied})." if applied else ".")
+        )
 
 
 class ValidationError(ValueError):
