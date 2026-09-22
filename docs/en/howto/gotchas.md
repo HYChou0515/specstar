@@ -325,6 +325,39 @@ field **or** the archive as a raw `application/octet-stream` body — so the
 export bytes round-trip directly (`--data-binary @dump.acbak`). See [Backup &
 Restore](./backup-restore.md#per-model-import) for `curl` recipes.
 
+The **global** route does not: `POST /_backup/import` takes the multipart
+form field only, and a raw body is a `422` (`body.file: Field required`).
+
+### `dump()` raises on an unreadable blob — by default
+
+`dump()` runs `strict=True`: a referenced blob the store will not return, or a
+revision whose payload will not decode, raises `DumpIncompleteError` instead of
+being left out of the archive. Before, both were skipped silently and the dump
+reported success, so an archive missing its attachments was indistinguishable
+from a complete one. Pass `strict=False` to export what is readable and check
+the returned per-model `DumpStats` (`complete`, `skipped_blobs`,
+`undecodable_revisions`).
+
+### A truncated archive is refused, not partially loaded
+
+Cutting an archive at a record boundary leaves whole, decodable records, so
+nothing downstream used to notice: `load()` returned `loaded=0` without
+raising. It now requires the end-of-stream record and raises
+`ArchiveTruncatedError` (`400` on the import routes) if the stream ends early.
+Loading is not transactional — batches already written stay written, and the
+error carries the counts that were applied.
+
+### The backup routes are permission-checked, but `access_scope` does not fence them
+
+`/_backup/*` and `/{model}/export|import` have no `Depends` of their own, but
+`dump` and `load` are permission-checked inside `ResourceManager` like every
+other action (`ResourceAction.dump` / `load`, grouped as
+`ResourceAction.backup`), and a refusal is a `403`. Two caveats: the default
+checker is `AllowAll()`, so out of the box they are as open as everything else;
+and `access_scope` restricts reads and request-writes only — a user allowed to
+`dump` gets **every** row of that model, not the rows their scope would show.
+Grant the backup actions to operators.
+
 ---
 
 ## GraphQL is opt-in
