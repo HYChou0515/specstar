@@ -81,11 +81,11 @@ class ExportRouteTemplate(BaseRouteTemplate):
             query_params: QueryInputs = Query(...),
         ) -> StreamingResponse:
             from specstar.resource_manager.dump_format import (
-                DumpStreamWriter,
                 EofRecord,
                 HeaderRecord,
                 ModelEndRecord,
                 ModelStartRecord,
+                encode_frame,
             )
 
             # Build optional filter (None → dump everything)
@@ -96,24 +96,31 @@ class ExportRouteTemplate(BaseRouteTemplate):
                 except Exception as e:
                     raise to_http_exception(e)
 
-            buf = io.BytesIO()
-            writer = DumpStreamWriter(buf)
-            writer.write(HeaderRecord())
-            writer.write(ModelStartRecord(model_name=model_name))
             try:
-                for record in resource_manager.dump(query=query_for_dump):
-                    writer.write(record)
+                # ``execute_with_events`` wraps ``dump`` in a plain
+                # function, so calling it runs the permission check even
+                # though the body is a generator — a refusal reaches here
+                # while the status code can still be set. An untranslated
+                # one left as a 500.
+                records = resource_manager.dump(query=query_for_dump)
             except Exception as e:
-                # ``dump`` is permission-checked at the ResourceManager
-                # layer; an untranslated refusal left here as a 500.
                 raise to_http_exception(e)
-            writer.write(ModelEndRecord(model_name=model_name))
-            writer.write(EofRecord())
 
-            buf.seek(0)
+            def frames():
+                # Framed as we go: the archive is never assembled whole.
+                # A failure once the response has started (a strict dump
+                # meeting an unreadable blob) truncates it, and a
+                # truncated archive is what ``load`` refuses.
+                yield encode_frame(HeaderRecord())
+                yield encode_frame(ModelStartRecord(model_name=model_name))
+                for record in records:
+                    yield encode_frame(record)
+                yield encode_frame(ModelEndRecord(model_name=model_name))
+                yield encode_frame(EofRecord())
+
             filename = f"{model_name}.acbak"
             return StreamingResponse(
-                buf,
+                frames(),
                 media_type="application/octet-stream",
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',

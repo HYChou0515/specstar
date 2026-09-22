@@ -7,7 +7,7 @@ import logging
 import os
 import warnings
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import (
@@ -3275,8 +3275,6 @@ class SpecStar:
         * ``POST /_backup/import`` — upload a ``.acbak`` archive and
           load its contents into the matching resource managers.
         """
-        import io as _io
-
         from fastapi import Query as _Query
         from fastapi.responses import StreamingResponse
 
@@ -3324,19 +3322,19 @@ class SpecStar:
                     )
                 model_queries = {m: None for m in models}
 
-            buf = _io.BytesIO()
             try:
-                specstar_ref.dump(buf, model_queries=model_queries)
+                # ``iter_dump`` resolves the models and runs every
+                # per-model permission check as it is CALLED, so a refusal
+                # arrives here — as PermissionDeniedError — while the
+                # status code can still be set. Untranslated it became a
+                # 500, which reads as "the library broke" and made the
+                # backup door look unguarded. Nothing is read from storage
+                # until the response starts pulling chunks.
+                chunks = specstar_ref.iter_dump(model_queries)
             except Exception as e:
-                # ``dump`` is permission-checked at the ResourceManager
-                # layer, so a refusal arrives here as PermissionDeniedError
-                # and must leave as a 403. Untranslated it became a 500,
-                # which reads as "the library broke" and made the backup
-                # door look unguarded.
                 raise to_http_exception(e)
-            buf.seek(0)
             return StreamingResponse(
-                buf,
+                chunks,
                 media_type="application/octet-stream",
                 headers={
                     "Content-Disposition": 'attachment; filename="backup.acbak"',
@@ -3590,19 +3588,45 @@ class SpecStar:
             with open("backup.acbak", "wb") as f:
                 specstar.dump(f, model_queries={"user": QB.name == "Alice"})
         """
-        from specstar.resource_manager.dump_format import (
-            DumpStats,
-            DumpStreamWriter,
-            EofRecord,
-            HeaderRecord,
-            ModelEndRecord,
-            ModelStartRecord,
-        )
-
-        writer = DumpStreamWriter(bio)
-        writer.write(HeaderRecord())
-
         stats: dict[str, DumpStats] = {}
+        for chunk in self.iter_dump(model_queries, strict=strict, stats=stats):
+            bio.write(chunk)
+        return stats
+
+    def iter_dump(
+        self,
+        model_queries: dict[str, Query | ResourceMetaSearchQuery | None] | None = None,
+        *,
+        strict: bool = True,
+        stats: dict[str, "DumpStats"] | None = None,
+    ) -> Iterator[bytes]:
+        """Produce the same archive as :meth:`dump`, as byte chunks.
+
+        Use this where the destination is not a file — an HTTP response,
+        a pipe, an uploader — so the archive never has to exist in memory
+        all at once.
+
+        Model resolution and the per-model permission check happen **when
+        this is called**, not at the first ``next()``: a refusal or an
+        unknown model name must be able to change an HTTP status code,
+        which is impossible once the first byte has been sent. The
+        consequence is that every model's ``BeforeDump`` fires up front
+        rather than interleaved with the writing.
+
+        Args:
+            model_queries: As :meth:`dump`.
+            strict: As :meth:`dump`.
+            stats: Optional dict to fill with per-model
+                :class:`DumpStats` — the return value has nowhere to go
+                on a generator, so pass one in if you need the counts.
+
+        Yields:
+            Length-prefixed frames, in archive order.
+        """
+        from specstar.resource_manager.dump_format import DumpStats
+
+        if stats is None:
+            stats = {}
 
         # Determine which models to dump
         if model_queries is None:
@@ -3610,21 +3634,49 @@ class SpecStar:
         else:
             models_to_dump = model_queries
 
+        # Eager: resolve every model and open every record generator now.
+        # ``execute_with_events`` wraps ``dump`` in a plain function, so
+        # calling it runs the permission check even though the body is a
+        # generator — which is exactly what lets a refusal become a 403
+        # before the response commits.
+        sections: list[tuple[str, Iterator[Any]]] = []
         for model_name, query in models_to_dump.items():
             if model_name not in self.resource_managers:
                 raise ValueError(
                     f"Model '{model_name}' not found in resource managers."
                 )
-            mgr = self.resource_managers[model_name]
             model_stats = DumpStats()
             stats[model_name] = model_stats
-            writer.write(ModelStartRecord(model_name=model_name))
-            for record in mgr.dump(query=query, strict=strict, stats=model_stats):
-                writer.write(record)
-            writer.write(ModelEndRecord(model_name=model_name))
+            sections.append(
+                (
+                    model_name,
+                    self.resource_managers[model_name].dump(
+                        query=query, strict=strict, stats=model_stats
+                    ),
+                )
+            )
 
-        writer.write(EofRecord())
-        return stats
+        return self._iter_dump_frames(sections)
+
+    @staticmethod
+    def _iter_dump_frames(
+        sections: "list[tuple[str, Iterator[Any]]]",
+    ) -> Iterator[bytes]:
+        from specstar.resource_manager.dump_format import (
+            EofRecord,
+            HeaderRecord,
+            ModelEndRecord,
+            ModelStartRecord,
+            encode_frame,
+        )
+
+        yield encode_frame(HeaderRecord())
+        for model_name, records in sections:
+            yield encode_frame(ModelStartRecord(model_name=model_name))
+            for record in records:
+                yield encode_frame(record)
+            yield encode_frame(ModelEndRecord(model_name=model_name))
+        yield encode_frame(EofRecord())
 
     def load(
         self,

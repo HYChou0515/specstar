@@ -461,6 +461,15 @@ class SimpleStorage(IStorage):
                 ) as data:
                     yield info, data
 
+    @property
+    def supports_bulk_dump(self) -> bool:
+        """Whether :meth:`dump_resources_bulk` can do anything for us.
+
+        Asked before a dump decides to collect resource ids, so a store
+        without a bulk path never pays for the id set it would not use.
+        """
+        return getattr(self._resource_store, "supports_bulk_dump", False)
+
     def dump_resources_bulk(
         self, resource_ids: frozenset[str] | None = None
     ) -> dict[str, list[tuple[RevisionInfo, bytes]]] | None:
@@ -4505,12 +4514,18 @@ class ResourceManager(IResourceManager[T], Generic[T]):
                     ) from e
                 record_stats.undecodable_revisions.append(info.revision_id)
 
-        # Try bulk pre-fetch (concurrent S3 downloads when supported).
-        # Materialise the metas once: the bulk path needs the id set, and
-        # the slow fallback iterates the same list.
-        metas_list = list(metas)
-        rid_set = frozenset(m.resource_id for m in metas_list)
-        bulk = self.storage.dump_resources_bulk(resource_ids=rid_set)
+        # Bulk pre-fetch (concurrent S3 downloads) needs the whole id set
+        # up front, so taking it costs one list of every meta. Ask first:
+        # disk and memory have no bulk path and used to pay for that list
+        # anyway, which on a large export is the one allocation that scales
+        # with the dataset instead of with the batch.
+        if getattr(self.storage, "supports_bulk_dump", False):
+            metas_list = list(metas)
+            rid_set = frozenset(m.resource_id for m in metas_list)
+            bulk = self.storage.dump_resources_bulk(resource_ids=rid_set)
+        else:
+            metas_list = metas
+            bulk = None
 
         if bulk is not None:
             for meta in metas_list:

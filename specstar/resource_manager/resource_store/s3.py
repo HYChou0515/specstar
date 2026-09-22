@@ -428,6 +428,8 @@ class S3ResourceStore(IResourceStore):
     # Bulk dump helpers
     # ------------------------------------------------------------------
 
+    supports_bulk_dump = True
+
     def dump_all_revisions(
         self,
         *,

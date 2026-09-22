@@ -142,6 +142,17 @@ _FRAME_SIZE = struct.calcsize(_FRAME_FMT)
 # ---------------------------------------------------------------------------
 
 
+def encode_frame(record: DumpRecord) -> bytes:
+    """Encode one record as its length-prefixed frame.
+
+    Exposed separately from :class:`DumpStreamWriter` so an archive can be
+    produced as an iterator of byte chunks — which is what lets an HTTP
+    export stream instead of being assembled in a buffer first.
+    """
+    payload = _encoder.encode(record)
+    return struct.pack(_FRAME_FMT, len(payload)) + payload
+
+
 class DumpStreamWriter:
     """Write ``DumpRecord`` objects to a binary stream with length-prefix framing."""
 
@@ -151,9 +162,7 @@ class DumpStreamWriter:
         self._bio = bio
 
     def write(self, record: DumpRecord) -> None:
-        payload = _encoder.encode(record)
-        self._bio.write(struct.pack(_FRAME_FMT, len(payload)))
-        self._bio.write(payload)
+        self._bio.write(encode_frame(record))
 
 
 class DumpStreamReader:

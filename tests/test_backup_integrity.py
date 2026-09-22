@@ -12,6 +12,7 @@ loud.  These tests pin the failure modes that used to be silent:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import io
 import warnings
@@ -225,3 +226,159 @@ class TestUnreadableBlob:
 
         with pytest.raises(ArchiveTruncatedError):
             _doc_spec().load(io.BytesIO(bio.getvalue()))
+
+
+def _asgi_body_chunks(app, path: str, watch) -> list[int]:
+    """GET *path* straight through the ASGI app, sampling *watch* per chunk.
+
+    ``TestClient`` collects the whole response body before handing back a
+    response object, so it reports a buffered archive and a streamed one
+    identically — it cannot see this difference at all. Driving the app
+    directly can: each ``http.response.body`` message is one chunk the
+    server would have flushed, and *watch* is sampled as it goes out.
+
+    Returns the ``watch()`` reading at each non-empty body chunk.
+    """
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"test")],
+        "client": ("test", 1),
+        "server": ("test", 80),
+    }
+    samples: list[int] = []
+    statuses: list[int] = []
+    first_receive = True
+
+    async def receive():
+        nonlocal first_receive
+        if first_receive:
+            first_receive = False
+            return {"type": "http.request", "body": b"", "more_body": False}
+        # StreamingResponse races the body against a disconnect listener;
+        # never disconnect, and let the body finishing end the exchange.
+        await asyncio.Event().wait()
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+        elif message["type"] == "http.response.body" and message.get("body"):
+            samples.append(watch())
+
+    async def run():
+        await asyncio.wait_for(app(scope, receive, send), timeout=30)
+
+    asyncio.run(run())
+    assert statuses == [200], statuses
+    return samples
+
+
+class TestStreamingExport:
+    """The export routes must not rebuild the whole archive in memory.
+
+    ``ResourceManager.dump`` genuinely streams, but both routes consumed
+    it into a ``BytesIO`` and handed *that* to ``StreamingResponse`` — so
+    the endpoint's peak memory was the size of the archive, exactly what
+    the docs promised it was not.
+    """
+
+    N = 50
+
+    def _counting_app(self):
+        """An app over ``N`` resources that counts each resource read."""
+        spec = _seeded(self.N)
+        storage = spec.resource_managers["item"].storage
+        reads: list[str] = []
+        original = storage.dump_resource
+
+        def counting(resource_id: str):
+            reads.append(resource_id)
+            return original(resource_id)
+
+        storage.dump_resource = counting
+        app = FastAPI()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            spec.apply(app)
+        return app, (lambda: len(reads))
+
+    def test_global_export_sends_bytes_before_reading_every_resource(self):
+        app, reads_so_far = self._counting_app()
+
+        samples = _asgi_body_chunks(app, "/_backup/export", reads_so_far)
+
+        assert samples[0] < self.N
+        assert len(samples) > 1, "a buffered archive goes out as one chunk"
+        assert samples[-1] == self.N
+
+    def test_per_model_export_sends_bytes_before_reading_every_resource(self):
+        app, reads_so_far = self._counting_app()
+
+        samples = _asgi_body_chunks(app, "/item/export", reads_so_far)
+
+        assert samples[0] < self.N
+        assert len(samples) > 1, "a buffered archive goes out as one chunk"
+        assert samples[-1] == self.N
+
+
+class TestDumpMetaStreaming:
+    """A dump on a non-bulk backend should not hold every meta at once.
+
+    ``dump`` materialised the meta iterator unconditionally, because the
+    bulk pre-fetch needs the id set up front. Disk and memory stores have
+    no bulk path — they are the ones that then paid for a list they never
+    used.
+    """
+
+    def test_a_store_without_bulk_dump_streams_its_metas(self):
+        spec = _seeded(50)
+        mgr = spec.resource_managers["item"]
+        storage = mgr.storage
+        pulled: list[str] = []
+        original = storage.dump_meta
+
+        def counting(resource_ids=None):
+            for meta in original(resource_ids):
+                pulled.append(meta.resource_id)
+                yield meta
+
+        storage.dump_meta = counting
+        assert storage.supports_bulk_dump is False
+
+        records = mgr.dump()
+        next(records)
+
+        assert len(pulled) < 50
+
+    def test_every_bulk_capable_store_advertises_it(self):
+        """The flag and the override must not drift apart.
+
+        ``supports_bulk_dump`` is what a dump consults *before* it decides
+        to collect resource ids. A store that overrides
+        ``dump_all_revisions`` but forgets the flag would silently lose
+        its bulk path — and nothing else would notice, because the
+        fallback is correct, only slower.
+        """
+        import specstar.resource_manager.resource_store.postgres  # noqa: F401
+        import specstar.resource_manager.resource_store.s3  # noqa: F401
+        from specstar.resource_manager.basic import IResourceStore
+
+        def every_subclass(cls):
+            for sub in cls.__subclasses__():
+                yield sub
+                yield from every_subclass(sub)
+
+        overriding = [
+            store
+            for store in every_subclass(IResourceStore)
+            if "dump_all_revisions" in vars(store)
+        ]
+        assert overriding, "expected at least the S3 and Postgres stores"
+        assert [s.__name__ for s in overriding if not s.supports_bulk_dump] == []
