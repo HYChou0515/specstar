@@ -3321,6 +3321,14 @@ class SpecStar:
                     "models are exported."
                 ),
             ),
+            strict: bool = _Query(
+                True,
+                description=(
+                    "Fail the export if a referenced blob or a resource's "
+                    "revision data cannot be read, instead of exporting an "
+                    "archive that is quietly short."
+                ),
+            ),
             current_user: str = Depends(deps.get_user),
             current_time: dt.datetime = Depends(deps.get_now),
         ):
@@ -3345,7 +3353,10 @@ class SpecStar:
                 # backup door look unguarded. Nothing is read from storage
                 # until the response starts pulling chunks.
                 chunks = specstar_ref.iter_dump(
-                    model_queries, user=current_user, now=current_time
+                    model_queries,
+                    strict=strict,
+                    user=current_user,
+                    now=current_time,
                 )
             except Exception as e:
                 raise to_http_exception(e)
@@ -3676,12 +3687,18 @@ class SpecStar:
         # calling it runs the permission check even though the body is a
         # generator — which is exactly what lets a refusal become a 403
         # before the response commits.
-        sections: list[tuple[str, Iterator[Any]]] = []
-        for model_name, query in models_to_dump.items():
+        # Resolve every name first. Opening a generator fires that model's
+        # dump events, so validating inside the same loop meant an unknown
+        # name at the end logged the earlier models as dumped and then
+        # exported nothing.
+        for model_name in models_to_dump:
             if model_name not in self.resource_managers:
                 raise ValueError(
                     f"Model '{model_name}' not found in resource managers."
                 )
+
+        sections: list[tuple[str, Iterator[Any]]] = []
+        for model_name, query in models_to_dump.items():
             model_stats = DumpStats()
             stats[model_name] = model_stats
             mgr = self.resource_managers[model_name]
@@ -3829,7 +3846,21 @@ class SpecStar:
             ):
                 flush()
 
-        for record in reader:
+        # The frame reader raises on a stream cut INSIDE a record — the
+        # realistic truncation, since a killed dump lands on a frame
+        # boundary only by luck. Draining it through this wrapper keeps
+        # the catch scoped to the reader (a ValueError raised by the loop
+        # body, e.g. an unknown model, still propagates as itself) so the
+        # final flush below still runs and the error still carries stats.
+        reader_error: list[Exception] = []
+
+        def _frames():
+            try:
+                yield from reader
+            except ValueError as e:
+                reader_error.append(e)
+
+        for record in _frames():
             if isinstance(record, ModelStartRecord):
                 current_model = record.model_name
                 if current_model not in self.resource_managers:
@@ -3865,6 +3896,8 @@ class SpecStar:
         # to stop. A complete archive already flushed at its ModelEndRecord,
         # so this is a no-op for it.
         flush()
+        if reader_error:
+            raise ArchiveTruncatedError(stats) from reader_error[0]
         if not saw_eof:
             raise ArchiveTruncatedError(stats)
         return stats

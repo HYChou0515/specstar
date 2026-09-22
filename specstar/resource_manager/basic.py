@@ -1904,6 +1904,15 @@ class IStorage(ABC):
     while optimizing for different access patterns and performance requirements.
     """
 
+    supports_bulk_dump: bool = False
+    """Whether :meth:`dump_resources_bulk` can really pre-fetch in bulk.
+
+    A dump asks this *before* collecting resource ids, because taking the
+    id set costs one list of every meta. Declared here so an implementer
+    can find it: a storage that wires a bulk-capable resource store and
+    leaves this False still works, just without the bulk path.
+    """
+
     @property
     def meta_store(self) -> "IMetaStore | None":
         """The single underlying metadata store, when this storage has one.

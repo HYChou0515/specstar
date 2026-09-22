@@ -40,6 +40,26 @@ from specstar.types import (
 T = TypeVar("T")
 
 
+class ExportQueryInputs(QueryInputs):
+    """Search filters plus the export-only ``strict`` switch.
+
+    A separate ``strict: bool = Query(...)`` parameter cannot be mixed
+    with a Pydantic query-parameter model — FastAPI then stops expanding
+    the model and asks for a literal ``query_params`` — so the switch is
+    a field here, exactly as ``returns`` is on
+    :class:`QueryInputsWithReturns`.
+    """
+
+    strict: bool = Query(
+        True,
+        description=(
+            "Fail the export if a referenced blob or a resource's revision "
+            "data cannot be read, instead of returning an archive that is "
+            "quietly short. Set false to export what is readable."
+        ),
+    )
+
+
 # ======================================================================
 # Export
 # ======================================================================
@@ -87,7 +107,7 @@ class ExportRouteTemplate(BaseRouteTemplate):
         )
         async def export_model(
             request: Request,
-            query_params: QueryInputs = Query(...),
+            query_params: ExportQueryInputs = Query(...),
             current_user: str = Depends(self.deps.get_user),
             current_time: dt.datetime = Depends(self.deps.get_now),
         ) -> StreamingResponse:
@@ -116,7 +136,9 @@ class ExportRouteTemplate(BaseRouteTemplate):
                 # this CALL, not around the generator body, for the same
                 # reason: that is where the check runs.
                 with resource_manager.using(current_user, current_time):
-                    records = resource_manager.dump(query=query_for_dump)
+                    records = resource_manager.dump(
+                        query=query_for_dump, strict=query_params.strict
+                    )
             except Exception as e:
                 raise to_http_exception(e)
 

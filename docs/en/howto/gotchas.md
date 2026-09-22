@@ -330,13 +330,19 @@ form field only, and a raw body is a `422` (`body.file: Field required`).
 
 ### `dump()` raises on an unreadable blob — by default
 
-`dump()` runs `strict=True`: a referenced blob the store will not return, or a
-revision whose payload will not decode, raises `DumpIncompleteError` instead of
-being left out of the archive. Before, both were skipped silently and the dump
-reported success, so an archive missing its attachments was indistinguishable
-from a complete one. Pass `strict=False` to export what is readable and check
-the returned per-model `DumpStats` (`complete`, `skipped_blobs`,
-`undecodable_revisions`).
+`dump()` runs `strict=True`: content the store will not give up — a referenced
+blob, or a resource's revision data — raises `DumpIncompleteError` instead of
+being left out of the archive. Before, both were skipped silently (the second
+one as a bare `KeyError`) and the dump reported success, so an archive missing
+its attachments was indistinguishable from a complete one. Pass `strict=False`,
+or `?strict=false` on either export route, to export what is readable and check
+the returned per-model `DumpStats`.
+
+A revision stored at an **older schema version** is not a failure: it does not
+decode under the current model, but that is a supported state and the payload
+is archived verbatim. It lands in `undecodable_revisions`, which clears
+`fully_verified` but leaves `complete` true — `complete` answers "is content
+missing", `fully_verified` answers "was everything checked".
 
 ### A truncated archive is refused, not partially loaded
 

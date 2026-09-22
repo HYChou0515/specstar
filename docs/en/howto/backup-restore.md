@@ -100,25 +100,40 @@ A backup whose failures are quiet is worse than no backup, because the
 discovery happens on restore day. Two guards make that impossible:
 
 **A dump refuses to produce a short archive.** `dump()` runs in
-`strict=True` mode by default: a referenced blob the store will not return,
-or a revision whose payload will not decode (and which therefore
-contributes none of the blob ids it references), raises
+`strict=True` mode by default: content the store will not give up —  a
+referenced blob, or a resource's revision data — raises
 `DumpIncompleteError` naming what it could not read. Both used to be
-skipped in silence.
+skipped in silence, and the second one used to surface as a bare
+`KeyError`.
 
 If exporting what *is* readable is the right call — salvaging from a
-damaged store, say — pass `strict=False` and read the stats:
+damaged store, say — pass `strict=False` and read the stats, or add
+`?strict=false` to either export route:
 
 ```python notest
 stats = spec.dump(open("backup.acbak", "wb"), strict=False)
 for model, s in stats.items():
     if not s.complete:
         print(model, "missing blobs:", s.skipped_blobs)
-        print(model, "undecodable revisions:", s.undecodable_revisions)
+        print(model, "unreadable resources:", s.unreadable_resources)
 ```
 
-`DumpStats` also carries `metas`, `revisions` and `blobs` counts.
-`complete` is the one question a backup script should ask.
+`DumpStats` also carries `metas`, `revisions` and `blobs` counts, and two
+questions that are deliberately different:
+
+- **`complete`** — nothing the archive should hold is known to be missing.
+  This is the one a backup script should ask.
+- **`fully_verified`** — `complete`, *and* every revision decoded, so every
+  blob reference was actually checked.
+
+They differ because a revision stored at an **older schema version** does
+not decode under the current model, and that is a supported state: reads
+migrate lazily and `migrate()` is optional. Such a payload goes into the
+archive verbatim; only the blob ids it *might* reference could not be read
+back. It lands in `undecodable_revisions`, clears `fully_verified` and
+leaves `complete` true — a gap in verification, not in content. Folding it
+into `complete` would flip the flag for any ordinary un-migrated store and
+teach operators to ignore it.
 
 **A load refuses a truncated archive.** Every archive ends with an
 end-of-stream record. If the bytes run out before it — a dump that died,
@@ -130,8 +145,22 @@ transactional, so batches already written stay written; the
 `ArchiveTruncatedError` carries the per-model counts that *were* applied,
 rather than pretending to undo them.
 
+A cut in the middle of a record is the ordinary shape — a killed process
+lands on a record boundary only by luck — and it is refused the same way,
+with the same counts.
+
 This is what makes a strict dump safe to keep: the partial file it leaves
 behind cannot later be restored as though it were whole.
+
+!!! note "Dump events fire when the dump starts, not when it finishes"
+
+    `dump` is a generator, and the `BeforeDump` / `OnSuccessDump` /
+    `AfterDump` events fire around the **call** that creates it. A failure
+    raised while the archive is being written — a strict failure, say —
+    therefore does not produce `OnFailureDump`, and `OnSuccessDump` has
+    already been emitted. Treat `OnSuccessDump` as "the export was
+    authorised and started". Check the returned `DumpStats`, or the
+    exception, for whether it finished.
 
 ---
 

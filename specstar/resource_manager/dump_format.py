@@ -91,6 +91,7 @@ class DumpStats:
         "revisions",
         "blobs",
         "skipped_blobs",
+        "unreadable_resources",
         "undecodable_revisions",
     )
 
@@ -99,17 +100,44 @@ class DumpStats:
         self.revisions = 0
         self.blobs = 0
         self.skipped_blobs: list[str] = []
+        self.unreadable_resources: list[str] = []
         self.undecodable_revisions: list[str] = []
 
     @property
     def complete(self) -> bool:
-        """True when nothing was skipped — the archive holds everything."""
-        return not self.skipped_blobs and not self.undecodable_revisions
+        """True when no bytes the archive should hold are known missing.
+
+        This is the question a backup script should ask. It answers
+        ``skipped_blobs`` only: an entry there is an attachment the store
+        would not give up, which is data lost from the archive.
+
+        It deliberately ignores ``undecodable_revisions``. A revision
+        stored at an older schema version is a supported state — reads
+        migrate lazily and ``migrate()`` is optional — and such a payload
+        is written to the archive verbatim either way. Only the blob ids
+        it *might* reference could not be read back, so it is a gap in
+        verification, not in content. Folding it in here would flip
+        ``complete`` to False for the ordinary un-migrated store and teach
+        operators to ignore the flag.
+        """
+        return not self.skipped_blobs and not self.unreadable_resources
+
+    @property
+    def fully_verified(self) -> bool:
+        """True when ``complete`` holds *and* every revision decoded.
+
+        The stricter question: not only is nothing known to be missing,
+        every revision's blob references were actually checked. Ask this
+        when the model carries attachments and you need certainty rather
+        than the absence of known loss.
+        """
+        return self.complete and not self.undecodable_revisions
 
     def __repr__(self) -> str:
         return (
             f"DumpStats(metas={self.metas}, revisions={self.revisions}, "
             f"blobs={self.blobs}, skipped_blobs={self.skipped_blobs!r}, "
+            f"unreadable_resources={self.unreadable_resources!r}, "
             f"undecodable_revisions={self.undecodable_revisions!r})"
         )
 

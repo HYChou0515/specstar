@@ -468,7 +468,7 @@ class SimpleStorage(IStorage):
         Asked before a dump decides to collect resource ids, so a store
         without a bulk path never pays for the id set it would not use.
         """
-        return getattr(self._resource_store, "supports_bulk_dump", False)
+        return self._resource_store.supports_bulk_dump
 
     def dump_resources_bulk(
         self, resource_ids: frozenset[str] | None = None
@@ -4447,12 +4447,15 @@ class ResourceManager(IResourceManager[T], Generic[T]):
         Args:
             query: Optional QB/search query.  When given, only matching
                 resources are exported.  ``None`` exports everything.
-            strict: When *True* (the default), a referenced blob that
-                cannot be read and a revision whose payload cannot be
-                decoded each raise :class:`DumpIncompleteError` instead of
-                being skipped.  Both used to be swallowed, so a short
-                archive looked like a successful backup.  Pass *False* to
-                dump what is readable and inspect *stats* afterwards.
+            strict: When *True* (the default), content the store will
+                not give up — a referenced blob, or a resource's revision
+                data — raises :class:`DumpIncompleteError` instead of
+                being skipped, because a short archive used to look like
+                a successful backup.  A revision that will not *decode*
+                is never fatal: an older stored schema version is a
+                supported state, so it is only recorded in
+                ``stats.undecodable_revisions``.  Pass *False* to dump
+                what is readable and inspect *stats* afterwards.
             stats: Optional :class:`DumpStats` to fill in as records are
                 yielded.  Counts are only final once the generator is
                 exhausted.
@@ -4467,16 +4470,33 @@ class ResourceManager(IResourceManager[T], Generic[T]):
 
         Raises:
             DumpIncompleteError: In ``strict`` mode, on the first blob or
-                revision that cannot be read.  The archive written so far
-                is partial and has no ``EofRecord``, so a later ``load``
-                also refuses it (:class:`ArchiveTruncatedError`).
+                resource whose data cannot be read.  The archive written
+                so far is partial and has no ``EofRecord``, so a later
+                ``load`` also refuses it
+                (:class:`ArchiveTruncatedError`).
+
+        Note:
+            This is a generator, and ``execute_with_events`` fires
+            ``BeforeDump`` / ``OnSuccessDump`` / ``AfterDump`` around the
+            **call** that creates it.  A failure raised while the records
+            are being produced therefore emits no ``OnFailureDump``, and
+            ``OnSuccessDump`` has already gone out — read it as "the dump
+            was authorized and started", not "the dump completed".
         """
         record_stats = stats if stats is not None else DumpStats()
 
         # Pre-hoist encoders
         meta_encode = self.meta_serializer.encode
         res_encode = self.resource_serializer.encode
-        has_blobs = self.blob_store is not None
+        # A model whose struct cannot carry a ``Binary`` anywhere has no
+        # ids to harvest, so it must not pay a decode for the harvest —
+        # and must certainly not fail on one. specstar compiles a
+        # collector only for a struct that can, which is the same guard
+        # ``collect_all_referenced_file_ids`` uses.
+        has_blobs = (
+            self.blob_store is not None
+            and self._binary_processor._collector is not None
+        )
         collect = self._binary_processor.collect_file_ids if has_blobs else None
         data_decode = self._data_serializer.decode if has_blobs else None
         blob_file_ids: set[str] = set()
@@ -4501,25 +4521,25 @@ class ResourceManager(IResourceManager[T], Generic[T]):
                 return
             try:
                 blob_file_ids.update(collect(data_decode(raw_data)))
-            except Exception as e:
-                # A revision we cannot decode may reference blobs we will
-                # therefore never see, so its attachments quietly stayed
-                # out of the archive. Same shape as the blob fetch below:
-                # the caller has to be able to find out.
-                if strict:
-                    raise DumpIncompleteError(
-                        self.resource_name,
-                        f"revision {info.revision_id}",
-                        str(e),
-                    ) from e
-                record_stats.undecodable_revisions.append(info.revision_id)
+            except Exception:
+                # Recorded, never fatal — even in strict mode. A revision
+                # that will not decode under the CURRENT serializer is a
+                # supported state, not damage: reads migrate lazily and
+                # ``migrate()`` is optional, so raising here would mean a
+                # model with un-migrated rows could not be backed up at
+                # all. What it costs is certainty, not bytes: the revision
+                # itself is already in the archive, and only the blob ids
+                # it might reference are unknown. An unreadable *blob*
+                # below is a definite loss and does raise.
+                if info.revision_id not in record_stats.undecodable_revisions:
+                    record_stats.undecodable_revisions.append(info.revision_id)
 
         # Bulk pre-fetch (concurrent S3 downloads) needs the whole id set
         # up front, so taking it costs one list of every meta. Ask first:
         # disk and memory have no bulk path and used to pay for that list
         # anyway, which on a large export is the one allocation that scales
         # with the dataset instead of with the batch.
-        if getattr(self.storage, "supports_bulk_dump", False):
+        if self.storage.supports_bulk_dump:
             metas_list = list(metas)
             rid_set = frozenset(m.resource_id for m in metas_list)
             bulk = self.storage.dump_resources_bulk(resource_ids=rid_set)
@@ -4528,24 +4548,45 @@ class ResourceManager(IResourceManager[T], Generic[T]):
             bulk = None
 
         if bulk is not None:
-            for meta in metas_list:
-                yield MetaRecord(data=meta_encode(meta))
-                record_stats.metas += 1
-                for info, raw_data in bulk.get(meta.resource_id, []):
-                    yield _make_rev_record(info, raw_data)
-                    record_stats.revisions += 1
-                    _collect_blobs(raw_data, info)
+
+            def _revisions(meta):
+                yield from bulk.get(meta.resource_id, ())
         else:
             # Slow path: stream one resource at a time
             dump_resource = self.storage.dump_resource
-            for meta in metas_list:
-                yield MetaRecord(data=meta_encode(meta))
-                record_stats.metas += 1
+
+            def _revisions(meta):
                 for info, data_io in dump_resource(meta.resource_id):
-                    raw_data = data_io.read()
+                    yield info, data_io.read()
+
+        for meta in metas_list:
+            yield MetaRecord(data=meta_encode(meta))
+            record_stats.metas += 1
+            seen = 0
+            try:
+                for info, raw_data in _revisions(meta):
                     yield _make_rev_record(info, raw_data)
                     record_stats.revisions += 1
+                    seen += 1
                     _collect_blobs(raw_data, info)
+                if seen == 0:
+                    raise LookupError("no revision data")
+            except Exception as e:
+                # The meta is in the archive and its data is not. Restoring
+                # that leaves a resource nothing can read — and a store in
+                # that state could not even be dumped again (a bare
+                # KeyError out of ``list_revisions``), so one partial
+                # restore used to become permanent. The bulk path could
+                # reach the same state in silence, by answering with an
+                # empty list for a resource it missed.
+                if strict:
+                    raise DumpIncompleteError(
+                        self.resource_name,
+                        f"revisions of {meta.resource_id}",
+                        str(e),
+                    ) from e
+                if meta.resource_id not in record_stats.unreadable_resources:
+                    record_stats.unreadable_resources.append(meta.resource_id)
 
         # Blobs (must come after all revisions so file_ids are fully collected)
         if has_blobs and blob_file_ids:

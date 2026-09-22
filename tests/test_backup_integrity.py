@@ -123,6 +123,31 @@ class TestTruncatedArchive:
         with pytest.raises(ArchiveTruncatedError):
             _spec().load(io.BytesIO(truncated))
 
+    def test_load_raises_with_stats_when_the_cut_is_mid_record(self):
+        """The realistic cut, and the one the guard first missed.
+
+        A killed process or a dropped transfer lands on a frame boundary
+        only by luck. Cut inside a frame, the frame reader raised a plain
+        ``ValueError`` that escaped the loop, so the final flush never ran
+        and the error carried no stats — the buffered batch was dropped
+        exactly as before, which is what this guard exists to stop.
+        """
+        archive = _archive(_seeded(20))
+        cut = archive[: len(archive) // 2]
+        dst = _spec()
+
+        with pytest.raises(ArchiveTruncatedError) as exc_info:
+            dst.load(io.BytesIO(cut), batch_size=1000)
+
+        assert exc_info.value.stats["item"].loaded > 0
+        # The batch really was written, not just counted. A cut mid-record
+        # can leave a meta whose revision data never arrived, so re-dump
+        # non-strict and let it report that rather than refuse.
+        bio = io.BytesIO()
+        dst.dump(bio, strict=False)
+        restored = list(DumpStreamReader(io.BytesIO(bio.getvalue())))
+        assert sum(isinstance(r, MetaRecord) for r in restored) > 0
+
     def test_truncated_load_keeps_the_records_it_did_read(self):
         """The whole records before the cut are applied, and the error says so.
 
@@ -398,3 +423,151 @@ class TestDumpMetaStreaming:
         ]
         assert overriding, "expected at least the S3 and Postgres stores"
         assert [s.__name__ for s in overriding if not s.supports_bulk_dump] == []
+
+
+class ItemV1(msgspec.Struct):
+    name: str
+    qty: int
+
+
+class ItemV2(msgspec.Struct):
+    name: str
+    quantity: int
+    sku: str
+
+
+class TestStrictAndOldRevisions:
+    """Strict mode must not refuse to back up a supported state.
+
+    Revisions stored at an older schema version are first-class here —
+    reads migrate them lazily and `migrate()` is explicitly optional. They
+    do not decode under the current serializer, and `dump` decodes every
+    payload only to harvest blob ids. Making that fatal turned "this model
+    has un-migrated rows" into "this model cannot be backed up".
+    """
+
+    @staticmethod
+    def _store_with_a_v1_revision(tmp_path):
+        from specstar import Schema
+        from specstar.backend import DiskStorageFactory
+
+        def to_v2(old: ItemV1) -> ItemV2:
+            return ItemV2(name=old.name, quantity=old.qty, sku=f"AUTO-{old.name}")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            writer = SpecStar()
+            writer.configure(
+                storage_factory=DiskStorageFactory(str(tmp_path)), default_user="t"
+            )
+            writer.add_model(Schema(ItemV1, "v1"), name="item")
+            mgr = writer.get_resource_manager(ItemV1)
+            with mgr.using(user="t", now=dt.datetime.now()) as ops:
+                ops.create(ItemV1(name="widget", qty=7))
+
+            reader = SpecStar()
+            reader.configure(
+                storage_factory=DiskStorageFactory(str(tmp_path)), default_user="t"
+            )
+            reader.add_model(
+                Schema(ItemV2, "v2").step("v1", to_v2, source_type=ItemV1),
+                name="item",
+            )
+        return reader
+
+    def test_a_model_with_no_blobs_dumps_despite_an_old_revision(self, tmp_path):
+        spec = self._store_with_a_v1_revision(tmp_path)
+        bio = io.BytesIO()
+
+        stats = spec.dump(bio)
+
+        assert stats["item"].revisions == 1
+        # Nothing is missing: the revision is in the archive verbatim and
+        # the model owns no attachments. Only the blob-id harvest failed,
+        # which `fully_verified` — not `complete` — reports.
+        assert stats["item"].complete is True
+        assert stats["item"].fully_verified is False
+        assert stats["item"].skipped_blobs == []
+        records = list(DumpStreamReader(io.BytesIO(bio.getvalue())))
+        assert type(records[-1]).__name__ == "EofRecord"
+
+    def test_the_archive_round_trips(self, tmp_path):
+        spec = self._store_with_a_v1_revision(tmp_path)
+        bio = io.BytesIO()
+        spec.dump(bio)
+
+        assert b"widget" in bio.getvalue()
+
+
+class TestPartiallyRestoredStore:
+    """Re-dumping after a partial restore must not be a bare `KeyError`.
+
+    A truncated load is reported, not rolled back, so a resource can end
+    up with a meta and no revision data. `dump` read revisions
+    unguarded, so that store could not be backed up at all — one partial
+    restore became permanent, with an exception no caller could act on.
+    """
+
+    @staticmethod
+    def _store_missing_a_revision() -> SpecStar:
+        archive = _archive(_seeded(3))
+        records = list(DumpStreamReader(io.BytesIO(archive)))
+        # Keep the final MetaRecord, drop the RevisionRecord that follows.
+        kept = [r for i, r in enumerate(records) if i != len(records) - 3]
+        out = io.BytesIO()
+        writer = DumpStreamWriter(out)
+        for record in kept:
+            writer.write(record)
+        dst = _spec()
+        dst.load(io.BytesIO(out.getvalue()))
+        return dst
+
+    def test_strict_names_the_resource_it_cannot_read(self):
+        dst = self._store_missing_a_revision()
+
+        with pytest.raises(DumpIncompleteError) as exc_info:
+            dst.dump(io.BytesIO())
+
+        assert "revisions of" in str(exc_info.value)
+
+    def test_non_strict_reports_it_and_keeps_going(self):
+        dst = self._store_missing_a_revision()
+        bio = io.BytesIO()
+
+        stats = dst.dump(bio, strict=False)
+
+        assert len(stats["item"].unreadable_resources) == 1
+        assert stats["item"].complete is False
+        # The other two resources are still exported, and the archive is
+        # terminated — a reportable gap, not a dead backup.
+        assert stats["item"].revisions == 2
+        records = list(DumpStreamReader(io.BytesIO(bio.getvalue())))
+        assert type(records[-1]).__name__ == "EofRecord"
+
+
+class TestStrictOverHttp:
+    """The export routes need the same escape hatch the library has.
+
+    With no way to say `strict=false` over HTTP, a single unreadable blob
+    made the model unexportable through the API: the route answers 200 and
+    then aborts mid-body, so the caller gets a short archive and no error.
+    """
+
+    def test_strict_is_the_default_and_truncates_a_damaged_export(self):
+        spec, _ = _spec_with_orphaned_blob()
+        client = _client(spec)
+
+        body = client.get("/doc/export").content
+
+        records = list(DumpStreamReader(io.BytesIO(body)))
+        assert not any(type(r).__name__ == "EofRecord" for r in records)
+
+    def test_strict_false_exports_what_is_readable(self):
+        spec, _ = _spec_with_orphaned_blob()
+        client = _client(spec)
+
+        body = client.get("/doc/export?strict=false").content
+
+        records = list(DumpStreamReader(io.BytesIO(body)))
+        assert type(records[-1]).__name__ == "EofRecord"
+        assert any(type(r).__name__ == "MetaRecord" for r in records)
