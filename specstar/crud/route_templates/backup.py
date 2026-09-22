@@ -361,13 +361,20 @@ class ImportRouteTemplate(BaseRouteTemplate):
                         elif isinstance(record, EofRecord):
                             saw_eof = True
                             break
-                except Exception as e:
+                except ValueError as e:
                     # The frame reader raises a plain ValueError on a
                     # stream cut inside a record — the ordinary
-                    # "upload stopped early". Only StopIteration on the
-                    # first read was handled, so that escaped as a 500
-                    # while the global route answered 400 for the same
-                    # bytes. One handler over the whole walk.
+                    # "upload stopped early". Report it as the truncation
+                    # it is, carrying the counts already applied, so both
+                    # cut shapes and both import routes answer alike.
+                    from specstar.crud.core import LoadStats
+
+                    raise to_http_exception(
+                        ArchiveTruncatedError(
+                            {model_name: LoadStats(loaded, skipped, total)}
+                        )
+                    ) from e
+                except Exception as e:
                     raise to_http_exception(e)
 
             # No EofRecord means the upload was cut short. Every record

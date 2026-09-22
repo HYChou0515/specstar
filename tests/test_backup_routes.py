@@ -541,15 +541,19 @@ ROOT = {"X-User": "root"}
 
 
 class TestBackupAuthorization:
-    """The backup doors answer 403 when the checker denies.
+    """The backup doors answer 403 to a caller the checker denies.
 
-    Permission *is* enforced — ``ResourceManager.dump`` / ``load`` are
-    wrapped by ``execute_with_events``, so a denied user never reaches the
-    data. But the four routes did not translate the refusal: global
-    export/import surfaced it as a 500 and per-model import as a 409,
-    which reads as "the library is broken" or "there was a conflict"
-    rather than "you may not do this" — and made the whole path look
-    unguarded from the outside.
+    Two bugs sat on top of each other here. The routes bound no identity
+    at all, so ``ResourceManager``'s permission check — real, and reached
+    from every caller — ran against the spec-level ``default_user``
+    rather than whoever called; with real authentication wired up, an
+    anonymous client downloaded the whole datastore. And when the check
+    did deny, none of the four routes translated the refusal: global
+    export/import let it escape as a 500, per-model import caught it in a
+    blanket handler and called it a 409.
+
+    So these assert both halves: the door is keyed to the *caller*, and a
+    refusal reads as 403.
     """
 
     def test_a_normal_route_is_keyed_to_the_caller(self):
@@ -637,3 +641,38 @@ class TestBackupAuthorization:
         assert client.get("/item").status_code == 200
         assert client.get("/item/export").status_code == 200
         assert client.get("/_backup/export").status_code == 200
+
+    def test_an_explicit_route_templates_list_still_binds_the_caller(self):
+        """`route_templates=[...]` must not reopen the door.
+
+        `configure` only assigned the effective `DependencyProvider` on
+        the dict/unset branch, so an explicit list left the global
+        `/_backup/*` routes on the built-in provider — no caller resolved,
+        each manager falling back to its own default. An unauthenticated
+        client could download and overwrite the whole datastore while the
+        per-model routes correctly refused.
+        """
+        from specstar.crud.route_templates.dependency_provider import (
+            DependencyProvider,
+        )
+        from specstar.crud.route_templates.search import ListRouteTemplate
+        from specstar.permission.simple import RootOnly
+
+        def get_user(request: Request) -> str:
+            return request.headers.get("X-User", "anon")
+
+        provider = DependencyProvider(get_user=get_user)
+        spec = SpecStar(
+            default_user="root",
+            default_now=dt.datetime.now,
+            permission_checker=RootOnly(root_user="root"),
+            dependency_provider=provider,
+            route_templates=[ListRouteTemplate(dependency_provider=provider)],
+        )
+        spec.add_model(Item, name="item")
+        app = FastAPI()
+        spec.apply(app)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        assert client.get("/_backup/export", headers=ANON).status_code == 403
+        assert client.get("/_backup/export", headers=ROOT).status_code == 200

@@ -330,28 +330,32 @@ form field only, and a raw body is a `422` (`body.file: Field required`).
 
 ### `dump()` raises on an unreadable blob — by default
 
-`dump()` runs `strict=True`: content the store will not give up — a referenced
-blob, or a resource's revision data — raises `DumpIncompleteError` instead of
-being left out of the archive. Before, both were skipped silently (the second
-one as a bare `KeyError`) and the dump reported success, so an archive missing
-its attachments was indistinguishable from a complete one. Pass `strict=False`,
-or `?strict=false` on either export route, to export what is readable and check
-the returned per-model `DumpStats`.
+`dump()` runs `strict=True`: content the store will not give up raises
+`DumpIncompleteError` instead of being left out of the archive. An unreadable
+blob used to be skipped in silence while the dump reported success, so a short
+archive was indistinguishable from a complete one; a resource whose revision
+data would not read used to die on a bare `KeyError` instead. Pass
+`strict=False` to export what is readable and check the returned per-model
+`DumpStats` — `complete` is the question to ask.
 
-A revision stored at an **older schema version** is not a failure: it does not
-decode under the current model, but that is a supported state and the payload
-is archived verbatim. It lands in `undecodable_revisions`, which clears
-`fully_verified` but leaves `complete` true — `complete` answers "is content
-missing", `fully_verified` answers "was everything checked".
+A revision stored at an **older schema version** does not decode under the
+current model, which is a supported state. For a model with no `Binary` field
+nothing is decoded at all and nothing is lost. For one that carries
+attachments it *is* a loss — that revision contributes no blob ids, so its
+attachment never enters the archive — and strict mode refuses, naming it.
+
+Both export routes accept `?strict=false`, but a streamed response has nowhere
+to return the stats: the archive comes back well-formed whatever was skipped
+and `load` accepts it. The server logs a warning; that is the only record.
 
 ### A truncated archive is refused, not partially loaded
 
 Cutting an archive at a record boundary leaves whole, decodable records, so
 nothing downstream used to notice: `load()` returned `loaded=0` without
-raising. It now requires the end-of-stream record and raises
-`ArchiveTruncatedError` if the stream ends at a record boundary (a cut in the
-middle of a record is caught by the frame reader as a `ValueError`). Both are a
-`400` on the import routes.
+raising. It now requires the end-of-stream record and now requires the end-of-stream
+record and raises `ArchiveTruncatedError` if the stream ends early — at a
+record boundary or inside a record, on both import routes, always a `400` and
+always carrying the counts that were applied.
 Loading is not transactional — batches already written stay written, and the
 error carries the counts that were applied.
 

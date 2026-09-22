@@ -192,7 +192,14 @@ class TestTruncatedArchiveOverHttp:
 
         for path in ("/item/import", "/_backup/import"):
             response = _client(_spec()).post(path, files={"file": ("x.acbak", cut)})
+
             assert response.status_code == 400, path
+            # Both cut shapes, on both routes, report the same way: as a
+            # truncation carrying the counts already applied. The per-model
+            # route used to hand back the frame reader's bare message.
+            detail = response.json()["detail"]
+            assert "truncated" in detail.lower(), (path, detail)
+            assert "loaded=" in detail, (path, detail)
 
     def test_global_import_rejects_a_truncated_archive(self):
         truncated = _truncate_after_last_revision(_archive(_seeded(5)))
@@ -426,11 +433,10 @@ class TestStrictAndOldRevisions:
         stats = spec.dump(bio)
 
         assert stats["item"].revisions == 1
-        # Nothing is missing: the revision is in the archive verbatim and
-        # the model owns no attachments. Only the blob-id harvest failed,
-        # which `fully_verified` — not `complete` — reports.
+        # The model cannot carry a `Binary`, so its payloads are never
+        # decoded and there is nothing a failed decode could have cost.
         assert stats["item"].complete is True
-        assert stats["item"].fully_verified is False
+        assert stats["item"].undecodable_revisions == []
         assert stats["item"].skipped_blobs == []
         records = list(DumpStreamReader(io.BytesIO(bio.getvalue())))
         assert type(records[-1]).__name__ == "EofRecord"
@@ -515,3 +521,71 @@ class TestStrictOverHttp:
         records = list(DumpStreamReader(io.BytesIO(body)))
         assert type(records[-1]).__name__ == "EofRecord"
         assert any(type(r).__name__ == "MetaRecord" for r in records)
+
+
+class TestUnMigratedRevisionWithAttachments:
+    """The other half of the same question, and the opposite answer.
+
+    For a model that CAN carry a `Binary`, a revision that will not decode
+    contributes no file ids — so its attachment is never written and the
+    archive comes out short while looking whole. Restoring it gives a
+    resource whose `Binary` points at a blob that is not there. That is
+    the exact failure #450 exists to kill, so here it is fatal.
+    """
+
+    @staticmethod
+    def _store(tmp_path):
+        from specstar import Schema
+        from specstar.backend import DiskStorageFactory
+
+        class DocV1(msgspec.Struct):
+            title: str
+            file: Binary | None = None
+
+        class DocV2(msgspec.Struct):
+            title: str
+            owner: str
+            file: Binary | None = None
+
+        def to_v2(old: DocV1) -> DocV2:
+            return DocV2(title=old.title, owner="auto", file=old.file)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            writer = SpecStar()
+            writer.configure(
+                storage_factory=DiskStorageFactory(str(tmp_path)), default_user="t"
+            )
+            writer.add_model(Schema(DocV1, "v1"), name="doc")
+            mgr = writer.get_resource_manager(DocV1)
+            with mgr.using(user="t", now=dt.datetime.now()) as ops:
+                ops.create(DocV1(title="contract", file=Binary(data=b"attachment")))
+
+            reader = SpecStar()
+            reader.configure(
+                storage_factory=DiskStorageFactory(str(tmp_path)), default_user="t"
+            )
+            reader.add_model(
+                Schema(DocV2, "v2").step("v1", to_v2, source_type=DocV1), name="doc"
+            )
+        return reader
+
+    def test_strict_refuses_rather_than_lose_the_attachment(self, tmp_path):
+        spec = self._store(tmp_path)
+
+        with pytest.raises(DumpIncompleteError) as exc_info:
+            spec.dump(io.BytesIO())
+
+        assert "blob references" in str(exc_info.value)
+        assert "migrate()" in str(exc_info.value)
+
+    def test_non_strict_says_the_archive_is_not_complete(self, tmp_path):
+        spec = self._store(tmp_path)
+        bio = io.BytesIO()
+
+        stats = spec.dump(bio, strict=False)
+
+        assert stats["doc"].complete is False
+        assert len(stats["doc"].undecodable_revisions) == 1
+        # The proof it matters: the attachment is not in the archive.
+        assert b"attachment" not in bio.getvalue()

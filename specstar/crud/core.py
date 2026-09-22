@@ -608,6 +608,37 @@ class SpecStar:
 
         if rebuild_templates:
             self.route_templates = []
+
+            # Resolve the effective provider for BOTH branches. The global
+            # ``/_backup/*`` routes are registered by SpecStar itself,
+            # outside ``apply``'s per-model loop, and read it from here —
+            # so computing it only on the dict/unset branch left an
+            # explicit ``route_templates=[...]`` list with those routes
+            # resolving no caller at all, i.e. unauthenticated.
+            #
+            # Falling back to the provider already on the instance (rather
+            # than a fresh one) is what keeps a constructor-supplied
+            # ``get_user`` alive across a later
+            # ``configure(default_user=...)``; ``with_default_user``
+            # returns self when a custom ``get_user`` is set, so a real
+            # authentication dependency still wins.
+            dep_provider = (
+                dependency_provider
+                if dependency_provider is not UNSET
+                else self._dependency_provider
+            )
+
+            # Propagate default_user to the DependencyProvider so that
+            # route handlers receive the configured user instead of
+            # "anonymous" when no custom get_user is set.
+            effective_default_user = (
+                default_user if default_user is not UNSET else self.default_user
+            )
+            if effective_default_user is not UNSET:
+                base_dp = dep_provider or DependencyProvider()
+                dep_provider = base_dp.with_default_user(effective_default_user)
+            self._dependency_provider = dep_provider or DependencyProvider()
+
             if (
                 route_templates is UNSET
                 or route_templates is None
@@ -616,21 +647,6 @@ class SpecStar:
                 route_templates_dict = (
                     route_templates if isinstance(route_templates, dict) else {}
                 )
-                dep_provider = (
-                    dependency_provider if dependency_provider is not UNSET else None
-                )
-
-                # Propagate default_user to the DependencyProvider so that
-                # route handlers receive the configured user instead of
-                # "anonymous" when no custom get_user is set.
-                effective_default_user = (
-                    default_user if default_user is not UNSET else self.default_user
-                )
-                if effective_default_user is not UNSET:
-                    base_dp = dep_provider or DependencyProvider()
-                    dep_provider = base_dp.with_default_user(effective_default_user)
-                self._dependency_provider = dep_provider or DependencyProvider()
-
                 for rt in [
                     CreateRouteTemplate,
                     ListRouteTemplate,
@@ -3721,11 +3737,12 @@ class SpecStar:
                     )
                 )
 
-        return self._iter_dump_frames(sections)
+        return self._iter_dump_frames(sections, stats)
 
     @staticmethod
     def _iter_dump_frames(
         sections: "list[tuple[str, Iterator[Any]]]",
+        stats: "dict[str, DumpStats]",
     ) -> Iterator[bytes]:
         from specstar.resource_manager.dump_format import (
             EofRecord,
@@ -3742,6 +3759,24 @@ class SpecStar:
                 yield encode_frame(record)
             yield encode_frame(ModelEndRecord(model_name=model_name))
         yield encode_frame(EofRecord())
+
+        # A non-strict export ends with a well-formed archive whatever it
+        # skipped: every truncation check passes, ``load`` accepts it and
+        # reports full success. The caller of ``dump`` reads that off the
+        # returned stats — a streaming HTTP caller has nowhere to read it,
+        # so the operator's only record is this line.
+        for model_name, model_stats in stats.items():
+            if not model_stats.complete:
+                logger.warning(
+                    "dump of %r finished incomplete: %d blob(s) unreadable, "
+                    "%d resource(s) without revision data, %d revision(s) "
+                    "whose blob references could not be read. The archive is "
+                    "well-formed and will restore without complaint.",
+                    model_name,
+                    len(model_stats.skipped_blobs),
+                    len(model_stats.unreadable_resources),
+                    len(model_stats.undecodable_revisions),
+                )
 
     def load(
         self,

@@ -2136,7 +2136,7 @@ class IResourceManager(ABC, Generic[T]):
         strict: bool = True,
         stats: "DumpStats | None" = None,
     ) -> "Generator[MetaRecord | RevisionRecord | BlobRecord]":
-        """Dump all resource data as a series of archive records.
+        """Dump this manager's resources as a series of archive records.
 
         Args:
             query: Optional filter; ``None`` dumps everything.
@@ -2145,31 +2145,16 @@ class IResourceManager(ABC, Generic[T]):
             stats: Optional :class:`DumpStats` to fill as records are
                 yielded.
 
-        Returns:
-            Generator[tuple[str, IO[bytes]]]: generator yielding (filename, fileobj) pairs for each resource.
+        Yields:
+            :class:`MetaRecord`, :class:`RevisionRecord` and
+            :class:`BlobRecord` objects.  For each resource the meta record
+            comes first, immediately followed by that resource's revision
+            records; blob records are emitted at the end of the model, in
+            ``file_id`` order.
 
-        ---
-
-        Exports all resources in the manager as a series of tar archive entries.
-        Each entry represents one resource and contains both its metadata and
-        all revision data in a structured format.
-
-        The generator yields tuples where:
-        - filename: A unique identifier for the resource (typically the resource_id)
-        - fileobj: An IO[bytes] object containing the tar archive data for that resource
-
-        This method is designed for:
-        - Complete data backup and export operations
-        - Migrating resources between different systems
-        - Creating portable resource archives
-        - Bulk data transfer scenarios
-
-        The tar archive format ensures that all resource information including
-        metadata, revision history, and data content is preserved in a
-        standardized, portable format.
-
-        Note: This method does not filter by deletion status, so both active
-        and soft-deleted resources will be included in the dump.
+        The records are framed as length-prefixed msgpack by
+        :class:`~specstar.resource_manager.dump_format.DumpStreamWriter`
+        (the ``.acbak`` format).  There is no tar anywhere on this path.
         """
 
     @abstractmethod

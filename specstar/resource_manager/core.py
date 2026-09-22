@@ -4512,16 +4512,26 @@ class ResourceManager(IResourceManager[T], Generic[T]):
                 return
             try:
                 blob_file_ids.update(collect(data_decode(raw_data)))
-            except Exception:
-                # Recorded, never fatal — even in strict mode. A revision
-                # that will not decode under the CURRENT serializer is a
-                # supported state, not damage: reads migrate lazily and
-                # ``migrate()`` is optional, so raising here would mean a
-                # model with un-migrated rows could not be backed up at
-                # all. What it costs is certainty, not bytes: the revision
-                # itself is already in the archive, and only the blob ids
-                # it might reference are unknown. An unreadable *blob*
-                # below is a definite loss and does raise.
+            except Exception as e:
+                # Reached only for a model that can actually carry a
+                # ``Binary`` (see the gate above), and there an undecodable
+                # revision IS content loss: it contributes no file ids, so
+                # its attachment is never emitted and the archive comes out
+                # short while looking whole. Restoring it gives a resource
+                # whose ``Binary`` points at a blob that is not there.
+                #
+                # A revision at an older stored schema version is the usual
+                # way to land here — reads migrate lazily and ``migrate()``
+                # is optional — so the message has to be actionable rather
+                # than alarming: migrate, or dump with ``strict=False`` and
+                # read the stats.
+                if strict:
+                    raise DumpIncompleteError(
+                        self.resource_name,
+                        f"the blob references of revision {info.revision_id}",
+                        f"{e} — run migrate() to persist the upgrade, or "
+                        "dump with strict=False",
+                    ) from e
                 if info.revision_id not in record_stats.undecodable_revisions:
                     record_stats.undecodable_revisions.append(info.revision_id)
 

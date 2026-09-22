@@ -105,33 +105,25 @@ class DumpStats:
 
     @property
     def complete(self) -> bool:
-        """True when no bytes the archive should hold are known missing.
+        """True when nothing the archive should hold is missing.
 
-        This is the question a backup script should ask. It answers
-        ``skipped_blobs`` only: an entry there is an attachment the store
-        would not give up, which is data lost from the archive.
+        The one question a backup script should ask. False when any of
+        ``skipped_blobs`` (an attachment the store would not give up),
+        ``unreadable_resources`` (revision data that would not read) or
+        ``undecodable_revisions`` is non-empty.
 
-        It deliberately ignores ``undecodable_revisions``. A revision
-        stored at an older schema version is a supported state — reads
-        migrate lazily and ``migrate()`` is optional — and such a payload
-        is written to the archive verbatim either way. Only the blob ids
-        it *might* reference could not be read back, so it is a gap in
-        verification, not in content. Folding it in here would flip
-        ``complete`` to False for the ordinary un-migrated store and teach
-        operators to ignore the flag.
+        An undecodable revision counts because it is only ever recorded
+        for a model that can carry a ``Binary``: such a revision
+        contributes no file ids, so its attachment is silently left out
+        and the archive comes out short while looking whole. A model that
+        cannot carry one is never decoded in the first place, so it never
+        lands here.
         """
-        return not self.skipped_blobs and not self.unreadable_resources
-
-    @property
-    def fully_verified(self) -> bool:
-        """True when ``complete`` holds *and* every revision decoded.
-
-        The stricter question: not only is nothing known to be missing,
-        every revision's blob references were actually checked. Ask this
-        when the model carries attachments and you need certainty rather
-        than the absence of known loss.
-        """
-        return self.complete and not self.undecodable_revisions
+        return not (
+            self.skipped_blobs
+            or self.unreadable_resources
+            or self.undecodable_revisions
+        )
 
     def __repr__(self) -> str:
         return (

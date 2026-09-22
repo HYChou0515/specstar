@@ -107,8 +107,7 @@ skipped in silence, and the second one used to surface as a bare
 `KeyError`.
 
 If exporting what *is* readable is the right call — salvaging from a
-damaged store, say — pass `strict=False` and read the stats, or add
-`?strict=false` to either export route:
+damaged store, say — pass `strict=False` and read the stats:
 
 ```python notest
 stats = spec.dump(open("backup.acbak", "wb"), strict=False)
@@ -118,36 +117,46 @@ for model, s in stats.items():
         print(model, "unreadable resources:", s.unreadable_resources)
 ```
 
-`DumpStats` also carries `metas`, `revisions` and `blobs` counts, and two
-questions that are deliberately different:
+!!! warning "`?strict=false` over HTTP has nowhere to report"
 
-- **`complete`** — nothing the archive should hold is known to be missing.
-  This is the one a backup script should ask.
-- **`fully_verified`** — `complete`, *and* every revision decoded, so every
-  blob reference was actually checked.
+    Both export routes take `?strict=false`, but a streamed response has
+    no place to put the stats: the archive that comes back is well-formed
+    whatever was skipped, and `load` will accept it and report full
+    success. The server logs a warning naming what was left out — that is
+    the only record. Prefer `spec.dump(..., strict=False)` in-process when
+    you need to act on the result.
 
-They differ because a revision stored at an **older schema version** does
-not decode under the current model, and that is a supported state: reads
-migrate lazily and `migrate()` is optional. Such a payload goes into the
-archive verbatim; only the blob ids it *might* reference could not be read
-back. It lands in `undecodable_revisions`, clears `fully_verified` and
-leaves `complete` true — a gap in verification, not in content. Folding it
-into `complete` would flip the flag for any ordinary un-migrated store and
-teach operators to ignore it.
+`DumpStats` also carries `metas`, `revisions` and `blobs` counts, and
+`complete` — nothing the archive should hold is missing — is the one
+question a backup script should ask.
+
+One case is worth knowing about. A revision stored at an **older schema
+version** does not decode under the current model, and that is a supported
+state: reads migrate lazily and `migrate()` is optional. For a model that
+carries **no** attachments the payload is archived verbatim and nothing is
+lost, so it is never even decoded — `dump` only decodes to harvest blob
+ids, and a model that cannot hold a `Binary` has none to harvest.
+
+For a model that **can** hold one, the same revision is a real loss: it
+contributes no file ids, so its attachment never enters the archive and
+the restored resource points at a blob that is not there. Strict mode
+refuses, naming the revision and telling you to run `migrate()` first;
+`strict=False` records it in `undecodable_revisions`, which clears
+`complete`.
 
 **A load refuses a truncated archive.** Every archive ends with an
 end-of-stream record. If the bytes run out before it — a dump that died,
-a transfer that stopped, a strict failure part-way — the archive is
-refused: a cut at a record boundary raises `ArchiveTruncatedError`, a cut
-in the middle of a record is caught by the frame reader itself
-(`ValueError`), and both are a `400` on the import routes. Loading is not
-transactional, so batches already written stay written; the
-`ArchiveTruncatedError` carries the per-model counts that *were* applied,
-rather than pretending to undo them.
+a transfer that stopped, a strict failure part-way — `load()` raises
+`ArchiveTruncatedError` and the import routes answer `400`. Both cut
+shapes are treated alike: a cut at a record boundary is caught by the
+missing end-of-stream record, a cut *inside* a record (the ordinary
+shape — a killed process lands on a boundary only by luck) by the frame
+reader, and the reader's error is re-raised as the same
+`ArchiveTruncatedError`, chained as its `__cause__`.
 
-A cut in the middle of a record is the ordinary shape — a killed process
-lands on a record boundary only by luck — and it is refused the same way,
-with the same counts.
+Loading is not transactional, so batches already written stay written;
+the error carries the per-model counts that *were* applied, rather than
+pretending to undo them.
 
 This is what makes a strict dump safe to keep: the partial file it leaves
 behind cannot later be restored as though it were whole.
