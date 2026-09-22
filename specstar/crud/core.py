@@ -3279,6 +3279,10 @@ class SpecStar:
         from fastapi import Query as _Query
         from fastapi.responses import StreamingResponse
 
+        from specstar.crud.route_templates.exception_handlers import (
+            to_http_exception,
+        )
+
         specstar_ref = self  # closure over self
 
         @router.get(
@@ -3320,7 +3324,15 @@ class SpecStar:
                 model_queries = {m: None for m in models}
 
             buf = _io.BytesIO()
-            specstar_ref.dump(buf, model_queries=model_queries)
+            try:
+                specstar_ref.dump(buf, model_queries=model_queries)
+            except Exception as e:
+                # ``dump`` is permission-checked at the ResourceManager
+                # layer, so a refusal arrives here as PermissionDeniedError
+                # and must leave as a 403. Untranslated it became a 500,
+                # which reads as "the library broke" and made the backup
+                # door look unguarded.
+                raise to_http_exception(e)
             buf.seek(0)
             return StreamingResponse(
                 buf,
@@ -3365,8 +3377,11 @@ class SpecStar:
             await file.seek(0)
             try:
                 stats = specstar_ref.load(file.file, on_duplicate=strategy)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                # ValueError (bad archive) still maps to 400 through the
+                # shared mapper; a denied load now maps to 403 instead of
+                # escaping as a 500.
+                raise to_http_exception(e)
 
             return {
                 model: {

@@ -490,3 +490,80 @@ class TestOpenAPISchemaGeneration:
         paths = schema.get("paths", {})
         assert "/_backup/export" in paths
         assert "/_backup/import" in paths
+
+
+# ======================================================================
+# Authorization (issue #450)
+# ======================================================================
+
+
+def _locked_app() -> tuple[SpecStar, TestClient, bytes]:
+    """An app whose only allowed user is ``root``, driven as ``anon``.
+
+    Returns the spec, a client that surfaces a 500 instead of raising, and
+    a valid archive produced by a permissive twin — so the import tests
+    exercise the permission check rather than a parse failure.
+    """
+    from specstar.permission.simple import RootOnly
+
+    donor = SpecStar(default_user="root", default_now=dt.datetime.now)
+    donor.add_model(Item, name="item")
+    _seed(donor, "item", [Item(name="secret", price=1)])
+    buf = io.BytesIO()
+    donor.dump(buf)
+
+    spec = SpecStar(
+        default_user="anon",
+        default_now=dt.datetime.now,
+        permission_checker=RootOnly(root_user="root"),
+    )
+    spec.add_model(Item, name="item")
+    # Seed as root: the point is to deny the *route*, not the fixture.
+    with spec.resource_managers["item"].using(user="root", now=dt.datetime.now()):
+        spec.resource_managers["item"].create(Item(name="TOP-SECRET-XYZ", price=99))
+    app = FastAPI()
+    spec.apply(app)
+    return spec, TestClient(app, raise_server_exceptions=False), buf.getvalue()
+
+
+class TestBackupAuthorization:
+    """The backup doors answer 403 when the checker denies.
+
+    Permission *is* enforced — ``ResourceManager.dump`` / ``load`` are
+    wrapped by ``execute_with_events``, so a denied user never reaches the
+    data. But the four routes did not translate the refusal: global
+    export/import surfaced it as a 500 and per-model import as a 409,
+    which reads as "the library is broken" or "there was a conflict"
+    rather than "you may not do this" — and made the whole path look
+    unguarded from the outside.
+    """
+
+    def test_global_export_is_forbidden_not_a_server_error(self):
+        _, client, _ = _locked_app()
+
+        resp = client.get("/_backup/export")
+
+        assert resp.status_code == 403
+        assert b"TOP-SECRET-XYZ" not in resp.content
+
+    def test_per_model_export_is_forbidden_not_a_server_error(self):
+        _, client, _ = _locked_app()
+
+        resp = client.get("/item/export")
+
+        assert resp.status_code == 403
+        assert b"TOP-SECRET-XYZ" not in resp.content
+
+    def test_global_import_is_forbidden_not_a_server_error(self):
+        _, client, archive = _locked_app()
+
+        resp = client.post("/_backup/import", files={"file": ("x.acbak", archive)})
+
+        assert resp.status_code == 403
+
+    def test_per_model_import_is_forbidden_not_a_conflict(self):
+        _, client, archive = _locked_app()
+
+        resp = client.post("/item/import", files={"file": ("x.acbak", archive)})
+
+        assert resp.status_code == 403

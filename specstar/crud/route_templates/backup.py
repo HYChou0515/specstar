@@ -100,8 +100,13 @@ class ExportRouteTemplate(BaseRouteTemplate):
             writer = DumpStreamWriter(buf)
             writer.write(HeaderRecord())
             writer.write(ModelStartRecord(model_name=model_name))
-            for record in resource_manager.dump(query=query_for_dump):
-                writer.write(record)
+            try:
+                for record in resource_manager.dump(query=query_for_dump):
+                    writer.write(record)
+            except Exception as e:
+                # ``dump`` is permission-checked at the ResourceManager
+                # layer; an untranslated refusal left here as a 500.
+                raise to_http_exception(e)
             writer.write(ModelEndRecord(model_name=model_name))
             writer.write(EofRecord())
 
@@ -261,7 +266,11 @@ class ImportRouteTemplate(BaseRouteTemplate):
                     try:
                         ok = resource_manager.load_record(record, strategy)
                     except Exception as e:
-                        raise HTTPException(status_code=409, detail=str(e))
+                        # Was a blanket 409: it turned a permission refusal
+                        # into "conflict" and every storage failure into one
+                        # too. The shared mapper keeps the real conflicts at
+                        # 409 and sends a refusal to 403.
+                        raise to_http_exception(e)
                     if ok:
                         loaded += 1
                     else:
@@ -277,12 +286,18 @@ class ImportRouteTemplate(BaseRouteTemplate):
                     raw = resource_manager.resource_serializer.decode(record.data)  # ty:ignore[unresolved-attribute]
                     if raw.info.resource_id in skipped_ids:
                         continue
-                    resource_manager.load_record(record, strategy)
+                    try:
+                        resource_manager.load_record(record, strategy)
+                    except Exception as e:
+                        raise to_http_exception(e)
 
                 elif isinstance(record, BlobRecord):
                     if not in_target_section:
                         continue
-                    resource_manager.load_record(record, strategy)
+                    try:
+                        resource_manager.load_record(record, strategy)
+                    except Exception as e:
+                        raise to_http_exception(e)
 
                 elif isinstance(record, EofRecord):
                     saw_eof = True
