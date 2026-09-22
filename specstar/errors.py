@@ -3,6 +3,7 @@
 from specstar.types import (
     ArchiveTruncatedError,
     CannotModifyResourceError,
+    DumpIncompleteError,
     DuplicateResourceError,
     MissingOperationContextError,
     PermissionDeniedError,
@@ -26,6 +27,7 @@ __all__ = [
     "ArchiveTruncatedError",
     "CannotModifyResourceError",
     "DuplicateResourceError",
+    "DumpIncompleteError",
     "MissingOperationContextError",
     "PermissionDeniedError",
     "PreconditionFailedError",

@@ -2526,6 +2526,32 @@ class MissingOperationContextError(Exception):
         super().__init__(msg)
 
 
+class DumpIncompleteError(Exception):
+    """A dump could not read something the archive needed (issue #450).
+
+    Raised by ``ResourceManager.dump`` in its default ``strict=True`` mode
+    when a referenced blob will not load, or when a revision's payload will
+    not decode (and so contributes none of the blob ids it references).
+    Both used to be ``except Exception: pass``: the archive came out short
+    and the dump reported success, which is the one failure mode a backup
+    must never have, because it surfaces on restore day.
+
+    Pass ``strict=False`` to dump anyway and read
+    :class:`~specstar.resource_manager.dump_format.DumpStats` for what was
+    skipped.
+    """
+
+    def __init__(self, resource_name: str, what: str, reason: str = ""):
+        self.resource_name = resource_name
+        self.what = what
+        self.reason = reason
+        super().__init__(
+            f"Dump of {resource_name!r} is incomplete: could not read {what}"
+            + (f" ({reason})" if reason else "")
+            + ". Pass strict=False to dump anyway and read DumpStats."
+        )
+
+
 class ArchiveTruncatedError(ValueError):
     """A ``.acbak`` stream ended before its :class:`EofRecord` (issue #450).
 

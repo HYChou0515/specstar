@@ -74,6 +74,46 @@ class EofRecord(Struct, tag=True, tag_field="t"):
     pass
 
 
+class DumpStats:
+    """What one model's dump actually managed to read (issue #450).
+
+    A dump used to be a bare generator: it swallowed an unreadable blob
+    and an undecodable revision alike, and finished normally either way,
+    so a caller could not tell a complete archive from one missing its
+    attachments. With ``strict=False`` the failures land here instead of
+    being lost.
+
+    ``complete`` is the one question a backup script should ask.
+    """
+
+    __slots__ = (
+        "metas",
+        "revisions",
+        "blobs",
+        "skipped_blobs",
+        "undecodable_revisions",
+    )
+
+    def __init__(self) -> None:
+        self.metas = 0
+        self.revisions = 0
+        self.blobs = 0
+        self.skipped_blobs: list[str] = []
+        self.undecodable_revisions: list[str] = []
+
+    @property
+    def complete(self) -> bool:
+        """True when nothing was skipped — the archive holds everything."""
+        return not self.skipped_blobs and not self.undecodable_revisions
+
+    def __repr__(self) -> str:
+        return (
+            f"DumpStats(metas={self.metas}, revisions={self.revisions}, "
+            f"blobs={self.blobs}, skipped_blobs={self.skipped_blobs!r}, "
+            f"undecodable_revisions={self.undecodable_revisions!r})"
+        )
+
+
 # The discriminated union used for decoding.
 DumpRecord = Union[
     HeaderRecord,

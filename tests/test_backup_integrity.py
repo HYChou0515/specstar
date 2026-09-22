@@ -16,22 +16,54 @@ import datetime as dt
 import io
 import warnings
 
+import msgspec
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from msgspec import Struct
 
 from specstar.crud.core import SpecStar
-from specstar.errors import ArchiveTruncatedError
+from specstar.errors import ArchiveTruncatedError, DumpIncompleteError
 from specstar.resource_manager.dump_format import (
     DumpStreamReader,
     DumpStreamWriter,
     MetaRecord,
 )
+from specstar.types import Binary
 
 
 class Item(Struct):
     payload: str
+
+
+class Doc(msgspec.Struct):
+    title: str
+    file: Binary | None = None
+
+
+def _doc_spec() -> SpecStar:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        spec = SpecStar(default_user="tester", default_now=dt.datetime.now)
+        spec.add_model(Doc, name="doc")
+    return spec
+
+
+def _spec_with_orphaned_blob() -> tuple[SpecStar, str]:
+    """A resource whose attachment is no longer in the blob store.
+
+    This is what a backup meets in the wild: the row still references the
+    file, the bytes are gone. Returns the spec and the missing ``file_id``.
+    """
+    from xxhash import xxh3_128_hexdigest
+
+    spec = _doc_spec()
+    mgr = spec.resource_managers["doc"]
+    with mgr.using(user="tester", now=dt.datetime.now()) as ops:
+        ops.create(Doc(title="t", file=Binary(data=b"payload")))
+    file_id = xxh3_128_hexdigest(b"payload")
+    spec.blob_store.delete(file_id)
+    return spec, file_id
 
 
 def _spec() -> SpecStar:
@@ -130,3 +162,66 @@ class TestTruncatedArchiveOverHttp:
 
         assert response.status_code == 400
         assert "truncated" in response.json()["detail"].lower()
+
+
+class TestUnreadableBlob:
+    """A blob the dump cannot read must not vanish from the archive.
+
+    `resource_manager/core.py` wrapped the blob fetch in a bare
+    ``except Exception: pass``, so an unreadable attachment was dropped
+    and the dump still finished normally. For a backup that is the one
+    failure that must never be quiet — it is discovered on restore day.
+    """
+
+    def test_dump_raises_when_a_referenced_blob_cannot_be_read(self):
+        spec, file_id = _spec_with_orphaned_blob()
+
+        with pytest.raises(DumpIncompleteError) as exc_info:
+            spec.dump(io.BytesIO())
+
+        assert file_id in str(exc_info.value)
+
+    def test_non_strict_dump_reports_the_blob_it_skipped(self):
+        """Opting out of strict must still hand back the evidence.
+
+        "Dump what you can" is a legitimate choice; "dump what you can and
+        say nothing" is not. The caller gets per-model stats and can ask
+        ``complete``.
+        """
+        spec, file_id = _spec_with_orphaned_blob()
+        bio = io.BytesIO()
+
+        stats = spec.dump(bio, strict=False)
+
+        assert stats["doc"].skipped_blobs == [file_id]
+        assert stats["doc"].complete is False
+        assert stats["doc"].metas == 1
+        assert stats["doc"].revisions == 1
+        assert stats["doc"].blobs == 0
+
+    def test_a_healthy_dump_reports_complete(self):
+        spec = _seeded(3)
+        bio = io.BytesIO()
+
+        stats = spec.dump(bio)
+
+        assert stats["item"].complete is True
+        assert stats["item"].metas == 3
+        assert stats["item"].revisions == 3
+
+    def test_a_strict_failure_leaves_an_archive_load_refuses(self):
+        """The two guards meet: a dump that died writes a file load rejects.
+
+        Strict mode raises part-way through, so the bytes on disk have no
+        ``EofRecord``. Someone who keeps that file and tries to restore it
+        later gets ``ArchiveTruncatedError`` rather than a quiet partial
+        restore — neither guard has to know about the other.
+        """
+        spec, _ = _spec_with_orphaned_blob()
+        bio = io.BytesIO()
+
+        with pytest.raises(DumpIncompleteError):
+            spec.dump(bio)
+
+        with pytest.raises(ArchiveTruncatedError):
+            _doc_spec().load(io.BytesIO(bio.getvalue()))

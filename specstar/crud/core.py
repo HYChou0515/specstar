@@ -21,6 +21,7 @@ from typing import (
 
 if TYPE_CHECKING:
     from specstar.locks import ILockBackend, LockHandle
+    from specstar.resource_manager.dump_format import DumpStats
 
 from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.params import Body
@@ -3553,7 +3554,9 @@ class SpecStar:
         self,
         bio: IO[bytes],
         model_queries: dict[str, Query | ResourceMetaSearchQuery | None] | None = None,
-    ) -> None:
+        *,
+        strict: bool = True,
+    ) -> dict[str, "DumpStats"]:
         """Export resources to a streaming msgpack archive.
 
         Args:
@@ -3563,6 +3566,17 @@ class SpecStar:
                 When provided, only the listed models are exported;
                 each value is a ``Query`` / ``ResourceMetaSearchQuery``
                 (or *None* for "all resources of that model").
+            strict: When *True* (the default), a referenced blob that
+                cannot be read — or a revision whose payload cannot be
+                decoded — raises :class:`DumpIncompleteError` rather than
+                being left out of the archive in silence. Pass *False* to
+                export what is readable and check the returned stats.
+
+        Returns:
+            Per-model :class:`DumpStats`: how many metas, revisions and
+            blobs were written, and which blobs / revisions were skipped.
+            ``stats[model].complete`` is the one question a backup script
+            should ask.
 
         Example::
 
@@ -3577,6 +3591,7 @@ class SpecStar:
                 specstar.dump(f, model_queries={"user": QB.name == "Alice"})
         """
         from specstar.resource_manager.dump_format import (
+            DumpStats,
             DumpStreamWriter,
             EofRecord,
             HeaderRecord,
@@ -3586,6 +3601,8 @@ class SpecStar:
 
         writer = DumpStreamWriter(bio)
         writer.write(HeaderRecord())
+
+        stats: dict[str, DumpStats] = {}
 
         # Determine which models to dump
         if model_queries is None:
@@ -3599,12 +3616,15 @@ class SpecStar:
                     f"Model '{model_name}' not found in resource managers."
                 )
             mgr = self.resource_managers[model_name]
+            model_stats = DumpStats()
+            stats[model_name] = model_stats
             writer.write(ModelStartRecord(model_name=model_name))
-            for record in mgr.dump(query=query):
+            for record in mgr.dump(query=query, strict=strict, stats=model_stats):
                 writer.write(record)
             writer.write(ModelEndRecord(model_name=model_name))
 
         writer.write(EofRecord())
+        return stats
 
     def load(
         self,
