@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from specstar.query import Query
     from specstar.resource_manager.dump_format import (
         BlobRecord,
+        DumpStats,
         MetaRecord,
         RevisionRecord,
     )
@@ -2131,8 +2132,18 @@ class IResourceManager(ABC, Generic[T]):
     def dump(
         self,
         query: Query | ResourceMetaSearchQuery | None = None,
+        *,
+        strict: bool = True,
+        stats: "DumpStats | None" = None,
     ) -> "Generator[MetaRecord | RevisionRecord | BlobRecord]":
-        """Dump all resource data as a series of tar archive entries.
+        """Dump all resource data as a series of archive records.
+
+        Args:
+            query: Optional filter; ``None`` dumps everything.
+            strict: Raise :class:`DumpIncompleteError` rather than leave
+                unreadable content out of the archive in silence.
+            stats: Optional :class:`DumpStats` to fill as records are
+                yielded.
 
         Returns:
             Generator[tuple[str, IO[bytes]]]: generator yielding (filename, fileobj) pairs for each resource.

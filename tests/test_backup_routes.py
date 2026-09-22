@@ -612,3 +612,28 @@ class TestBackupAuthorization:
             ).status_code
             == 200
         )
+
+    def test_a_per_model_default_user_still_reaches_the_global_routes(self):
+        """No HTTP auth configured → each model keeps its own default user.
+
+        `apply()` hands every route template a provider carrying that
+        model's `default_user`, but the global `/_backup/*` routes are
+        built outside that loop. Binding them to the spec-level provider
+        unconditionally made them run as `"anonymous"`, which *overrode*
+        the manager's own default and turned a working service backup
+        into a 403.
+        """
+        from specstar.permission.simple import RootOnly
+
+        spec = SpecStar(
+            default_now=dt.datetime.now,
+            permission_checker=RootOnly(root_user="svc"),
+        )
+        spec.add_model(Item, name="item", default_user="svc")
+        app = FastAPI()
+        spec.apply(app)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        assert client.get("/item").status_code == 200
+        assert client.get("/item/export").status_code == 200
+        assert client.get("/_backup/export").status_code == 200

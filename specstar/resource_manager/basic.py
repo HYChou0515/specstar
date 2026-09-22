@@ -1812,15 +1812,6 @@ class IResourceStore(ABC):
                 break
         return out, consumed
 
-    supports_bulk_dump: bool = False
-    """Whether :meth:`dump_all_revisions` can actually pre-fetch in bulk.
-
-    The caller has to ask *before* it commits to collecting resource ids:
-    a bulk fetch needs the whole id set up front, so a dump used to
-    materialise every meta just to find out the answer was ``None``.
-    Stores that override :meth:`dump_all_revisions` set this to ``True``.
-    """
-
     def dump_all_revisions(
         self, *, resource_ids: "frozenset[str] | None" = None
     ) -> "dict[str, list[tuple[RevisionInfo, bytes]]] | None":
@@ -1829,7 +1820,7 @@ class IResourceStore(ABC):
         ``None`` signals to the caller to fall back to per-resource
         streaming. Subclasses with bulk-fetch capability (e.g. S3
         list+get pipelines) override this to return a dict keyed by
-        ``resource_id`` — and set :attr:`supports_bulk_dump`.
+        ``resource_id``.
         """
         return None
 
@@ -1902,15 +1893,6 @@ class IStorage(ABC):
     This interface is typically implemented by storage systems that coordinate
     between separate metadata and resource stores, providing a unified view
     while optimizing for different access patterns and performance requirements.
-    """
-
-    supports_bulk_dump: bool = False
-    """Whether :meth:`dump_resources_bulk` can really pre-fetch in bulk.
-
-    A dump asks this *before* collecting resource ids, because taking the
-    id set costs one list of every meta. Declared here so an implementer
-    can find it: a storage that wires a bulk-capable resource store and
-    leaves this False still works, just without the bulk path.
     """
 
     @property

@@ -461,15 +461,6 @@ class SimpleStorage(IStorage):
                 ) as data:
                     yield info, data
 
-    @property
-    def supports_bulk_dump(self) -> bool:
-        """Whether :meth:`dump_resources_bulk` can do anything for us.
-
-        Asked before a dump decides to collect resource ids, so a store
-        without a bulk path never pays for the id set it would not use.
-        """
-        return self._resource_store.supports_bulk_dump
-
     def dump_resources_bulk(
         self, resource_ids: frozenset[str] | None = None
     ) -> dict[str, list[tuple[RevisionInfo, bytes]]] | None:
@@ -4534,18 +4525,23 @@ class ResourceManager(IResourceManager[T], Generic[T]):
                 if info.revision_id not in record_stats.undecodable_revisions:
                     record_stats.undecodable_revisions.append(info.revision_id)
 
-        # Bulk pre-fetch (concurrent S3 downloads) needs the whole id set
-        # up front, so taking it costs one list of every meta. Ask first:
-        # disk and memory have no bulk path and used to pay for that list
-        # anyway, which on a large export is the one allocation that scales
-        # with the dataset instead of with the batch.
-        if self.storage.supports_bulk_dump:
-            metas_list = list(metas)
-            rid_set = frozenset(m.resource_id for m in metas_list)
-            bulk = self.storage.dump_resources_bulk(resource_ids=rid_set)
-        else:
-            metas_list = metas
-            bulk = None
+        # Materialise the metas once: the bulk path needs the id set, and
+        # the slow fallback iterates the same list.
+        #
+        # Streaming this instead (issue #450 S6) looks like a free win and
+        # is not: the meta iterator would then stay open for the whole
+        # dump, and since the export routes now stream at the client's
+        # pace, a Postgres meta store would hold a pooled connection — a
+        # named cursor inside an open transaction, for a filtered export —
+        # for the length of the download. Idle-in-transaction, pool
+        # exhaustion under concurrent exports, and a server-side timeout
+        # that truncates the archive mid-stream, in exchange for an
+        # allocation that psycopg2's client-side cursor makes anyway.
+        # Doing it properly means paging the meta read, which is its own
+        # change; the reporter ranked S6 a follow-up.
+        metas_list = list(metas)
+        rid_set = frozenset(m.resource_id for m in metas_list)
+        bulk = self.storage.dump_resources_bulk(resource_ids=rid_set)
 
         if bulk is not None:
 

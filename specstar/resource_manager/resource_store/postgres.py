@@ -299,8 +299,6 @@ class PostgresResourceStore(IResourceStore):
                 )
             return self._info_serializer.decode(bytes(row[0])), bytes(row[1])
 
-    supports_bulk_dump = True
-
     def dump_all_revisions(
         self,
         *,

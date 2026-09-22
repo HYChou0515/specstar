@@ -369,62 +369,6 @@ class TestStreamingExport:
         assert samples[-1] == self.N
 
 
-class TestDumpMetaStreaming:
-    """A dump on a non-bulk backend should not hold every meta at once.
-
-    ``dump`` materialised the meta iterator unconditionally, because the
-    bulk pre-fetch needs the id set up front. Disk and memory stores have
-    no bulk path — they are the ones that then paid for a list they never
-    used.
-    """
-
-    def test_a_store_without_bulk_dump_streams_its_metas(self):
-        spec = _seeded(50)
-        mgr = spec.resource_managers["item"]
-        storage = mgr.storage
-        pulled: list[str] = []
-        original = storage.dump_meta
-
-        def counting(resource_ids=None):
-            for meta in original(resource_ids):
-                pulled.append(meta.resource_id)
-                yield meta
-
-        storage.dump_meta = counting
-        assert storage.supports_bulk_dump is False
-
-        records = mgr.dump()
-        next(records)
-
-        assert len(pulled) < 50
-
-    def test_every_bulk_capable_store_advertises_it(self):
-        """The flag and the override must not drift apart.
-
-        ``supports_bulk_dump`` is what a dump consults *before* it decides
-        to collect resource ids. A store that overrides
-        ``dump_all_revisions`` but forgets the flag would silently lose
-        its bulk path — and nothing else would notice, because the
-        fallback is correct, only slower.
-        """
-        import specstar.resource_manager.resource_store.postgres  # noqa: F401
-        import specstar.resource_manager.resource_store.s3  # noqa: F401
-        from specstar.resource_manager.basic import IResourceStore
-
-        def every_subclass(cls):
-            for sub in cls.__subclasses__():
-                yield sub
-                yield from every_subclass(sub)
-
-        overriding = [
-            store
-            for store in every_subclass(IResourceStore)
-            if "dump_all_revisions" in vars(store)
-        ]
-        assert overriding, "expected at least the S3 and Postgres stores"
-        assert [s.__name__ for s in overriding if not s.supports_bulk_dump] == []
-
-
 class ItemV1(msgspec.Struct):
     name: str
     qty: int

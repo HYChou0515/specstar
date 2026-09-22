@@ -3295,6 +3295,14 @@ class SpecStar:
         # spec-level default_user on every call, so a deployment with real
         # authentication had two open doors (#450 S4).
         deps = self._dependency_provider
+        # ...but only override the manager's own context when there really
+        # is a caller to resolve. These routes are registered outside
+        # ``apply``'s per-model loop, so ``deps`` never carries a model's
+        # ``add_model(default_user=...)``; forcing its built-in default
+        # here would replace that user with "anonymous" and 403 a service
+        # backup that works today. With no custom ``get_user``, leave the
+        # context unset and let each manager use its own default.
+        _resolves_a_caller = not deps._user_is_default
 
         @router.get(
             "/_backup/export",
@@ -3355,7 +3363,7 @@ class SpecStar:
                 chunks = specstar_ref.iter_dump(
                     model_queries,
                     strict=strict,
-                    user=current_user,
+                    user=current_user if _resolves_a_caller else UNSET,
                     now=current_time,
                 )
             except Exception as e:
@@ -3407,7 +3415,7 @@ class SpecStar:
                 stats = specstar_ref.load(
                     file.file,
                     on_duplicate=strategy,
-                    user=current_user,
+                    user=current_user if _resolves_a_caller else UNSET,
                     now=current_time,
                 )
             except Exception as e:
