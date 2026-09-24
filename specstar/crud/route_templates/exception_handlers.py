@@ -39,6 +39,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from specstar.types import (
+    DumpIncompleteError,
     PermissionDeniedError,
     PreconditionFailedError,
     ResourceConflictError,
@@ -141,6 +142,18 @@ def to_http_exception(e: Exception) -> HTTPException:
     # Other conflict errors (DuplicateResourceError, SchemaConflictError, etc.)
     if isinstance(e, ResourceConflictError):
         return HTTPException(status_code=409, detail=str(e))
+
+    # A strict dump found a blob / revision it could not read. Nothing is
+    # wrong with the request — the stored data is short — so this is a 500,
+    # not the 400 the fallback would have given it.
+    #
+    # The built-in export routes cannot reach this: they stream, so the
+    # error is raised while the body generator runs, long after the status
+    # line went out (the response simply truncates, and the missing
+    # EofRecord makes ``load`` refuse the result). This is here for a
+    # caller that consumes a dump inside a request and maps the failure.
+    if isinstance(e, DumpIncompleteError):
+        return HTTPException(status_code=500, detail=str(e))
 
     # Not implemented (e.g. blob store not configured)
     if isinstance(e, NotImplementedError):

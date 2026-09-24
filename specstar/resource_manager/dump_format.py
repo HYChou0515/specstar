@@ -74,6 +74,66 @@ class EofRecord(Struct, tag=True, tag_field="t"):
     pass
 
 
+class DumpStats:
+    """What one model's dump actually managed to read (issue #450).
+
+    A dump used to be a bare generator: it swallowed an unreadable blob
+    and an undecodable revision alike, and finished normally either way,
+    so a caller could not tell a complete archive from one missing its
+    attachments. With ``strict=False`` the failures land here instead of
+    being lost.
+
+    ``complete`` is the one question a backup script should ask.
+    """
+
+    __slots__ = (
+        "metas",
+        "revisions",
+        "blobs",
+        "skipped_blobs",
+        "unreadable_resources",
+        "undecodable_revisions",
+    )
+
+    def __init__(self) -> None:
+        self.metas = 0
+        self.revisions = 0
+        self.blobs = 0
+        self.skipped_blobs: list[str] = []
+        self.unreadable_resources: list[str] = []
+        self.undecodable_revisions: list[str] = []
+
+    @property
+    def complete(self) -> bool:
+        """True when nothing the archive should hold is missing.
+
+        The one question a backup script should ask. False when any of
+        ``skipped_blobs`` (an attachment the store would not give up),
+        ``unreadable_resources`` (revision data that would not read) or
+        ``undecodable_revisions`` is non-empty.
+
+        An undecodable revision counts because it is only ever recorded
+        for a model that can carry a ``Binary``: such a revision
+        contributes no file ids, so its attachment is silently left out
+        and the archive comes out short while looking whole. A model that
+        cannot carry one is never decoded in the first place, so it never
+        lands here.
+        """
+        return not (
+            self.skipped_blobs
+            or self.unreadable_resources
+            or self.undecodable_revisions
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"DumpStats(metas={self.metas}, revisions={self.revisions}, "
+            f"blobs={self.blobs}, skipped_blobs={self.skipped_blobs!r}, "
+            f"unreadable_resources={self.unreadable_resources!r}, "
+            f"undecodable_revisions={self.undecodable_revisions!r})"
+        )
+
+
 # The discriminated union used for decoding.
 DumpRecord = Union[
     HeaderRecord,
@@ -102,6 +162,17 @@ _FRAME_SIZE = struct.calcsize(_FRAME_FMT)
 # ---------------------------------------------------------------------------
 
 
+def encode_frame(record: DumpRecord) -> bytes:
+    """Encode one record as its length-prefixed frame.
+
+    Exposed separately from :class:`DumpStreamWriter` so an archive can be
+    produced as an iterator of byte chunks — which is what lets an HTTP
+    export stream instead of being assembled in a buffer first.
+    """
+    payload = _encoder.encode(record)
+    return struct.pack(_FRAME_FMT, len(payload)) + payload
+
+
 class DumpStreamWriter:
     """Write ``DumpRecord`` objects to a binary stream with length-prefix framing."""
 
@@ -111,9 +182,7 @@ class DumpStreamWriter:
         self._bio = bio
 
     def write(self, record: DumpRecord) -> None:
-        payload = _encoder.encode(record)
-        self._bio.write(struct.pack(_FRAME_FMT, len(payload)))
-        self._bio.write(payload)
+        self._bio.write(encode_frame(record))
 
 
 class DumpStreamReader:

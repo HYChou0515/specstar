@@ -1,7 +1,9 @@
 """Public exception facade for SpecStar."""
 
 from specstar.types import (
+    ArchiveTruncatedError,
     CannotModifyResourceError,
+    DumpIncompleteError,
     DuplicateResourceError,
     MissingOperationContextError,
     PermissionDeniedError,
@@ -22,8 +24,10 @@ from specstar.types import (
 )
 
 __all__ = [
+    "ArchiveTruncatedError",
     "CannotModifyResourceError",
     "DuplicateResourceError",
+    "DumpIncompleteError",
     "MissingOperationContextError",
     "PermissionDeniedError",
     "PreconditionFailedError",

@@ -123,10 +123,18 @@ class BinaryProcessor:
             container[0] = actual_processor
             return deferred_processor
 
-        # If no processor needed, we prefer returning None for optimization,
-        # but if we are in a recursion loop, previous callers got 'deferred_processor'.
-        # Since 'container[0]' is None, deferred_processor acts as identity.
-        # So it is safe.
+        # Nothing to do for this type. Drop the pre-registered stub as well,
+        # or the SECOND lookup of the same type returns a truthy
+        # deferred_processor and every caller that tests the result for
+        # truthiness concludes the type needs processing. Behaviour was
+        # unaffected — the stub is the identity function — but
+        # ``_collector is not None`` is exactly such a test, and it is what
+        # a dump asks to decide whether a model can carry a ``Binary`` at
+        # all. A struct with two same-typed fields answered "yes".
+        #
+        # A caller still mid-recursion holds the stub it was handed; that
+        # stays identity-safe, unchanged from before.
+        cache.pop(cache_key, None)
         return None
 
     def _compile_impl(

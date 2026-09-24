@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from enum import Enum, Flag, StrEnum, auto
 from typing import (
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from specstar.query import Query
     from specstar.resource_manager.dump_format import (
         BlobRecord,
+        DumpStats,
         MetaRecord,
         RevisionRecord,
     )
@@ -2131,34 +2132,29 @@ class IResourceManager(ABC, Generic[T]):
     def dump(
         self,
         query: Query | ResourceMetaSearchQuery | None = None,
+        *,
+        strict: bool = True,
+        stats: "DumpStats | None" = None,
     ) -> "Generator[MetaRecord | RevisionRecord | BlobRecord]":
-        """Dump all resource data as a series of tar archive entries.
+        """Dump this manager's resources as a series of archive records.
 
-        Returns:
-            Generator[tuple[str, IO[bytes]]]: generator yielding (filename, fileobj) pairs for each resource.
+        Args:
+            query: Optional filter; ``None`` dumps everything.
+            strict: Raise :class:`DumpIncompleteError` rather than leave
+                unreadable content out of the archive in silence.
+            stats: Optional :class:`DumpStats` to fill as records are
+                yielded.
 
-        ---
+        Yields:
+            :class:`MetaRecord`, :class:`RevisionRecord` and
+            :class:`BlobRecord` objects.  For each resource the meta record
+            comes first, immediately followed by that resource's revision
+            records; blob records are emitted at the end of the model, in
+            ``file_id`` order.
 
-        Exports all resources in the manager as a series of tar archive entries.
-        Each entry represents one resource and contains both its metadata and
-        all revision data in a structured format.
-
-        The generator yields tuples where:
-        - filename: A unique identifier for the resource (typically the resource_id)
-        - fileobj: An IO[bytes] object containing the tar archive data for that resource
-
-        This method is designed for:
-        - Complete data backup and export operations
-        - Migrating resources between different systems
-        - Creating portable resource archives
-        - Bulk data transfer scenarios
-
-        The tar archive format ensures that all resource information including
-        metadata, revision history, and data content is preserved in a
-        standardized, portable format.
-
-        Note: This method does not filter by deletion status, so both active
-        and soft-deleted resources will be included in the dump.
+        The records are framed as length-prefixed msgpack by
+        :class:`~specstar.resource_manager.dump_format.DumpStreamWriter`
+        (the ``.acbak`` format).  There is no tar anywhere on this path.
         """
 
     @abstractmethod
@@ -2524,6 +2520,64 @@ class MissingOperationContextError(Exception):
                 f"Provide via explicit kwargs, using() scope, or manager defaults."
             )
         super().__init__(msg)
+
+
+class DumpIncompleteError(Exception):
+    """A dump could not read something the archive needed (issue #450).
+
+    Raised by ``ResourceManager.dump`` in its default ``strict=True`` mode
+    when a referenced blob will not load, or when a revision's payload will
+    not decode (and so contributes none of the blob ids it references).
+    Both used to be ``except Exception: pass``: the archive came out short
+    and the dump reported success, which is the one failure mode a backup
+    must never have, because it surfaces on restore day.
+
+    Pass ``strict=False`` to dump anyway and read
+    :class:`~specstar.resource_manager.dump_format.DumpStats` for what was
+    skipped.
+    """
+
+    def __init__(self, resource_name: str, what: str, reason: str = ""):
+        self.resource_name = resource_name
+        self.what = what
+        self.reason = reason
+        super().__init__(
+            f"Dump of {resource_name!r} is incomplete: could not read {what}"
+            + (f" ({reason})" if reason else "")
+            + ". Pass strict=False to dump anyway and read DumpStats."
+        )
+
+
+class ArchiveTruncatedError(ValueError):
+    """A ``.acbak`` stream ended before its :class:`EofRecord` (issue #450).
+
+    The archive is incomplete — a dump that died part-way through, or a
+    transfer that stopped.  Cutting at a frame boundary leaves whole,
+    decodable records behind, so nothing downstream notices: the load used
+    to finish quietly and report ``loaded=0``, which is the one failure a
+    backup must never have.
+
+    Loading is **not** transactional.  Every batch written before the
+    stream ran out is already persisted, so this reports what was applied
+    rather than undoing it; ``stats`` carries the per-model counts as of
+    the moment the truncation was found.
+
+    Subclasses :class:`ValueError` so the archive-format handling that
+    already exists (``SpecStar.load`` documents ``ValueError``; the import
+    routes map it to ``400``) covers it without a second except clause.
+    """
+
+    def __init__(self, stats: Mapping[str, "LoadStats"] | None = None):
+        self.stats = dict(stats) if stats else {}
+        applied = ", ".join(
+            f"{model}: loaded={s.loaded} skipped={s.skipped}"
+            for model, s in sorted(self.stats.items())
+        )
+        super().__init__(
+            "Archive ended without an EofRecord, so it is truncated. "
+            "Records already written were NOT rolled back"
+            + (f" ({applied})." if applied else ".")
+        )
 
 
 class ValidationError(ValueError):

@@ -117,6 +117,7 @@ from specstar.resource_manager.pydantic_converter import (  # noqa: E402
 from specstar.types import (
     Binary,
     CannotModifyResourceError,
+    DumpIncompleteError,
     DuplicateResourceError,
     IConstraintChecker,
     IMessageQueue,
@@ -171,6 +172,7 @@ from specstar.resource_manager.basic import (
 from specstar.resource_manager.binary_processor import BinaryProcessor
 from specstar.resource_manager.dump_format import (
     BlobRecord,
+    DumpStats,
     MetaRecord,
     RevisionRecord,
 )
@@ -4422,30 +4424,70 @@ class ResourceManager(IResourceManager[T], Generic[T]):
     @execute_with_events(
         (BeforeDump, AfterDump, OnSuccessDump, OnFailureDump),
         "result",
-        inputs={"query": UNSET},
+        inputs={"query": UNSET, "strict": UNSET, "stats": UNSET},
     )
     def dump(
         self,
         query: Query | ResourceMetaSearchQuery | None = None,
+        *,
+        strict: bool = True,
+        stats: DumpStats | None = None,
     ) -> Generator[MetaRecord | RevisionRecord | BlobRecord]:
         """Dump metadata, revision data, and blobs as Record objects.
 
         Args:
             query: Optional QB/search query.  When given, only matching
                 resources are exported.  ``None`` exports everything.
+            strict: When *True* (the default), content the store will
+                not give up — a referenced blob, or a resource's revision
+                data — raises :class:`DumpIncompleteError` instead of
+                being skipped, because a short archive used to look like
+                a successful backup.  A revision that will not *decode*
+                is never fatal: an older stored schema version is a
+                supported state, so it is only recorded in
+                ``stats.undecodable_revisions``.  Pass *False* to dump
+                what is readable and inspect *stats* afterwards.
+            stats: Optional :class:`DumpStats` to fill in as records are
+                yielded.  Counts are only final once the generator is
+                exhausted.
 
         Yields:
             :class:`MetaRecord`, :class:`RevisionRecord`, and
             :class:`BlobRecord` instances.  For each resource the meta
             record is yielded first, immediately followed by all its
             revision records — no intermediate id collection needed.
-            Blob records are emitted at the end.
+            Blob records are emitted at the end, in ``file_id`` order so
+            two dumps of the same data produce the same bytes.
+
+        Raises:
+            DumpIncompleteError: In ``strict`` mode, on the first blob or
+                resource whose data cannot be read.  The archive written
+                so far is partial and has no ``EofRecord``, so a later
+                ``load`` also refuses it
+                (:class:`ArchiveTruncatedError`).
+
+        Note:
+            This is a generator, and ``execute_with_events`` fires
+            ``BeforeDump`` / ``OnSuccessDump`` / ``AfterDump`` around the
+            **call** that creates it.  A failure raised while the records
+            are being produced therefore emits no ``OnFailureDump``, and
+            ``OnSuccessDump`` has already gone out — read it as "the dump
+            was authorized and started", not "the dump completed".
         """
+        record_stats = stats if stats is not None else DumpStats()
 
         # Pre-hoist encoders
         meta_encode = self.meta_serializer.encode
         res_encode = self.resource_serializer.encode
-        has_blobs = self.blob_store is not None
+        # A model whose struct cannot carry a ``Binary`` anywhere has no
+        # ids to harvest, so it must not pay a decode for the harvest —
+        # and must certainly not fail on one. specstar compiles a
+        # collector only for a struct that can, which is the same guard
+        # ``collect_all_referenced_file_ids`` uses.
+        has_blobs = (
+            self.blob_store is not None
+            and self._binary_processor._collector is not None
+        )
         collect = self._binary_processor.collect_file_ids if has_blobs else None
         data_decode = self._data_serializer.decode if has_blobs else None
         blob_file_ids: set[str] = set()
@@ -4465,55 +4507,128 @@ class ResourceManager(IResourceManager[T], Generic[T]):
                 data=res_encode(RawResource(info=info, raw_data=raw_data))
             )
 
-        def _collect_blobs(raw_data: bytes):
-            if collect is not None and data_decode is not None:
-                try:
-                    blob_file_ids.update(collect(data_decode(raw_data)))
-                except Exception:
-                    pass
+        def _collect_blobs(raw_data: bytes, info):
+            if collect is None or data_decode is None:
+                return
+            try:
+                blob_file_ids.update(collect(data_decode(raw_data)))
+            except Exception as e:
+                # Reached only for a model that can actually carry a
+                # ``Binary`` (see the gate above), and there an undecodable
+                # revision IS content loss: it contributes no file ids, so
+                # its attachment is never emitted and the archive comes out
+                # short while looking whole. Restoring it gives a resource
+                # whose ``Binary`` points at a blob that is not there.
+                #
+                # A revision at an older stored schema version is the usual
+                # way to land here — reads migrate lazily and ``migrate()``
+                # is optional — so the message has to be actionable rather
+                # than alarming: migrate, or dump with ``strict=False`` and
+                # read the stats.
+                if strict:
+                    raise DumpIncompleteError(
+                        self.resource_name,
+                        f"the blob references of revision {info.revision_id}",
+                        f"{e} — run migrate() to persist the upgrade, or "
+                        "dump with strict=False",
+                    ) from e
+                if info.revision_id not in record_stats.undecodable_revisions:
+                    record_stats.undecodable_revisions.append(info.revision_id)
 
-        # Try bulk pre-fetch (concurrent S3 downloads when supported).
         # Materialise the metas once: the bulk path needs the id set, and
         # the slow fallback iterates the same list.
+        #
+        # Streaming this instead (issue #450 S6) looks like a free win and
+        # is not: the meta iterator would then stay open for the whole
+        # dump, and since the export routes now stream at the client's
+        # pace, a Postgres meta store would hold a pooled connection — a
+        # named cursor inside an open transaction, for a filtered export —
+        # for the length of the download. Idle-in-transaction, pool
+        # exhaustion under concurrent exports, and a server-side timeout
+        # that truncates the archive mid-stream, in exchange for an
+        # allocation that psycopg2's client-side cursor makes anyway.
+        # Doing it properly means paging the meta read, which is its own
+        # change; the reporter ranked S6 a follow-up.
         metas_list = list(metas)
         rid_set = frozenset(m.resource_id for m in metas_list)
         bulk = self.storage.dump_resources_bulk(resource_ids=rid_set)
 
         if bulk is not None:
-            for meta in metas_list:
-                yield MetaRecord(data=meta_encode(meta))
-                for info, raw_data in bulk.get(meta.resource_id, []):
-                    yield _make_rev_record(info, raw_data)
-                    _collect_blobs(raw_data)
+
+            def _revisions(meta):
+                yield from bulk.get(meta.resource_id, ())
         else:
             # Slow path: stream one resource at a time
             dump_resource = self.storage.dump_resource
-            for meta in metas_list:
-                yield MetaRecord(data=meta_encode(meta))
+
+            def _revisions(meta):
                 for info, data_io in dump_resource(meta.resource_id):
-                    raw_data = data_io.read()
+                    yield info, data_io.read()
+
+        for meta in metas_list:
+            yield MetaRecord(data=meta_encode(meta))
+            record_stats.metas += 1
+            seen = 0
+            try:
+                for info, raw_data in _revisions(meta):
                     yield _make_rev_record(info, raw_data)
-                    _collect_blobs(raw_data)
+                    record_stats.revisions += 1
+                    seen += 1
+                    _collect_blobs(raw_data, info)
+                if seen == 0:
+                    raise LookupError("no revision data")
+            except Exception as e:
+                # The meta is in the archive and its data is not. Restoring
+                # that leaves a resource nothing can read — and a store in
+                # that state could not even be dumped again (a bare
+                # KeyError out of ``list_revisions``), so one partial
+                # restore used to become permanent. The bulk path could
+                # reach the same state in silence, by answering with an
+                # empty list for a resource it missed.
+                if strict:
+                    raise DumpIncompleteError(
+                        self.resource_name,
+                        f"revisions of {meta.resource_id}",
+                        str(e),
+                    ) from e
+                if meta.resource_id not in record_stats.unreadable_resources:
+                    record_stats.unreadable_resources.append(meta.resource_id)
 
         # Blobs (must come after all revisions so file_ids are fully collected)
         if has_blobs and blob_file_ids:
             blob_store = self.blob_store
-            for file_id in blob_file_ids:
+            # Sorted so the same data dumps to the same bytes twice;
+            # ``blob_file_ids`` is a set and its order is not stable.
+            for file_id in sorted(blob_file_ids):
                 try:
                     blob = blob_store.get(file_id)
-                    if blob.data is not UNSET:
-                        yield BlobRecord(
-                            file_id=file_id,
-                            blob_data=blob.data,
-                            size=blob.size
-                            if blob.size is not UNSET
-                            else len(blob.data),
-                            content_type=blob.content_type
-                            if blob.content_type is not UNSET
-                            else "",
+                except Exception as e:
+                    if strict:
+                        raise DumpIncompleteError(
+                            self.resource_name, f"blob {file_id}", str(e)
+                        ) from e
+                    record_stats.skipped_blobs.append(file_id)
+                    continue
+                if blob.data is UNSET:
+                    # The store answered without bytes — as invisible a
+                    # loss as a raise, and previously just as quiet.
+                    if strict:
+                        raise DumpIncompleteError(
+                            self.resource_name,
+                            f"blob {file_id}",
+                            "store returned no payload",
                         )
-                except Exception:
-                    pass
+                    record_stats.skipped_blobs.append(file_id)
+                    continue
+                yield BlobRecord(
+                    file_id=file_id,
+                    blob_data=blob.data,
+                    size=blob.size if blob.size is not UNSET else len(blob.data),
+                    content_type=blob.content_type
+                    if blob.content_type is not UNSET
+                    else "",
+                )
+                record_stats.blobs += 1
 
     def collect_all_referenced_file_ids(self) -> tuple[set[str], bool]:
         """Scan every revision of every resource for referenced blob file_ids.

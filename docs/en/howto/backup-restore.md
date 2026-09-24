@@ -59,23 +59,28 @@ That means you can export:
 
 Import accepts an `.acbak` archive and loads records back into the datastore.
 
-> **Upload format asymmetry.** `GET /{model}/export` *returns* the archive
-> as `application/octet-stream` (so the response body is the raw bytes),
-> but `POST /{model}/import` *accepts* the archive as
-> **`multipart/form-data`** with a single `file` form field — not as a raw
-> body. Sending the export bytes directly as the request body returns
-> `422` because the `file` form field is missing.
->
-> Correct upload with `curl`:
+> **Upload format.** `POST /{model}/import` accepts the archive **either**
+> as `multipart/form-data` with a single `file` form field **or** as a raw
+> `application/octet-stream` body — so the bytes from
+> `GET /{model}/export` round-trip directly.
 >
 > ```bash
 > # export → raw bytes on stdout, save to disk
 > curl -o dump.acbak http://localhost:8000/issue/export
 >
-> # import → multipart, use -F file=@...
-> curl -X POST -F 'file=@dump.acbak' -F 'on_duplicate=overwrite' \
->      http://localhost:8000/issue/import
+> # import → multipart
+> curl -X POST -F 'file=@dump.acbak' \
+>      'http://localhost:8000/issue/import?on_duplicate=overwrite'
+>
+> # import → raw body (round-trips with export)
+> curl -X POST --data-binary @dump.acbak \
+>      -H 'Content-Type: application/octet-stream' \
+>      'http://localhost:8000/issue/import?on_duplicate=overwrite'
 > ```
+>
+> The **global** route is stricter: `POST /_backup/import` takes only the
+> multipart form field, and a raw body returns `422` with
+> `body.file: Field required`.
 
 The important behavior control is `on_duplicate`, which defines how existing records should be handled.
 
@@ -86,6 +91,113 @@ Typical options are:
 - `raise_error`
 
 Choose the strategy based on whether the target environment should treat the archive as authoritative or only as an additive load.
+
+---
+
+## Knowing the archive is whole
+
+A backup whose failures are quiet is worse than no backup, because the
+discovery happens on restore day. Two guards make that impossible:
+
+**A dump refuses to produce a short archive.** `dump()` runs in
+`strict=True` mode by default: content the store will not give up —  a
+referenced blob, or a resource's revision data — raises
+`DumpIncompleteError` naming what it could not read. Both used to be
+skipped in silence, and the second one used to surface as a bare
+`KeyError`.
+
+If exporting what *is* readable is the right call — salvaging from a
+damaged store, say — pass `strict=False` and read the stats:
+
+```python notest
+stats = spec.dump(open("backup.acbak", "wb"), strict=False)
+for model, s in stats.items():
+    if not s.complete:
+        print(model, "missing blobs:", s.skipped_blobs)
+        print(model, "unreadable resources:", s.unreadable_resources)
+```
+
+!!! warning "`?strict=false` over HTTP has nowhere to report"
+
+    Both export routes take `?strict=false`, but a streamed response has
+    no place to put the stats: the archive that comes back is well-formed
+    whatever was skipped, and `load` will accept it and report full
+    success. The server logs a warning naming what was left out — that is
+    the only record. Prefer `spec.dump(..., strict=False)` in-process when
+    you need to act on the result.
+
+`DumpStats` also carries `metas`, `revisions` and `blobs` counts, and
+`complete` — nothing the archive should hold is missing — is the one
+question a backup script should ask.
+
+One case is worth knowing about. A revision stored at an **older schema
+version** does not decode under the current model, and that is a supported
+state: reads migrate lazily and `migrate()` is optional. For a model that
+carries **no** attachments the payload is archived verbatim and nothing is
+lost, so it is never even decoded — `dump` only decodes to harvest blob
+ids, and a model that cannot hold a `Binary` has none to harvest.
+
+For a model that **can** hold one, the same revision is a real loss: it
+contributes no file ids, so its attachment never enters the archive and
+the restored resource points at a blob that is not there. Strict mode
+refuses, naming the revision and telling you to run `migrate()` first;
+`strict=False` records it in `undecodable_revisions`, which clears
+`complete`.
+
+**A load refuses a truncated archive.** Every archive ends with an
+end-of-stream record. If the bytes run out before it — a dump that died,
+a transfer that stopped, a strict failure part-way — `load()` raises
+`ArchiveTruncatedError` and the import routes answer `400`. Both cut
+shapes are treated alike: a cut at a record boundary is caught by the
+missing end-of-stream record, a cut *inside* a record (the ordinary
+shape — a killed process lands on a boundary only by luck) by the frame
+reader, and the reader's error is re-raised as the same
+`ArchiveTruncatedError`, chained as its `__cause__`.
+
+Loading is not transactional, so batches already written stay written;
+the error carries the per-model counts that *were* applied, rather than
+pretending to undo them.
+
+This is what makes a strict dump safe to keep: the partial file it leaves
+behind cannot later be restored as though it were whole.
+
+!!! note "Dump events fire when the dump starts, not when it finishes"
+
+    `dump` is a generator, and the `BeforeDump` / `OnSuccessDump` /
+    `AfterDump` events fire around the **call** that creates it. A failure
+    raised while the archive is being written — a strict failure, say —
+    therefore does not produce `OnFailureDump`, and `OnSuccessDump` has
+    already been emitted. Treat `OnSuccessDump` as "the export was
+    authorised and started". Check the returned `DumpStats`, or the
+    exception, for whether it finished.
+
+---
+
+## Who may run a backup
+
+`dump` and `load` are actions like any other — `ResourceAction.dump`,
+`ResourceAction.load`, grouped as `ResourceAction.backup` — checked by
+your `permission_checker`. All four backup routes resolve the request's
+user through the same `DependencyProvider` as every other generated
+route, so the check is against the caller and a refusal is a `403`.
+
+Two things follow that are easy to get wrong:
+
+- **The default `permission_checker` is `AllowAll()`.** Out of the box the
+  backup routes are as open as every other route. `configure(admin=...)`
+  or a custom `IPermissionChecker` closes them; gate on
+  `ResourceAction.backup` to allow or deny the whole path at once.
+- **`access_scope` does not fence a backup.** It restricts reads and
+  request-writes, but `dump` is a privileged, whole-model operation that
+  reads through storage directly. A user allowed to `dump` gets every row
+  of that model, not the rows their scope would show them. Grant the
+  backup actions to operators, not to end users.
+
+Calling the library directly, pass the user the same way:
+
+```python notest
+stats = spec.dump(open("backup.acbak", "wb"), user="operator")
+```
 
 ---
 
@@ -123,9 +235,15 @@ Treat restore validation as part of the process, not as an optional extra step.
 
 ## Operational advice
 
-- large archives stream on both ends — `dump()` writes record by record and
-  `load()` writes in batches (`batch_size` / `batch_bytes`), so memory is
-  bounded by the batch, not by the archive; for multi-GB files prefer
+- large archives stream on both ends — `dump()` writes record by record,
+  both export routes send frames as they are produced, and `load()`
+  writes in batches (`batch_size` / `batch_bytes`), so memory is bounded
+  by the batch, not by the archive. `SpecStar.iter_dump()` is the same
+  archive as an iterator of byte chunks (it is what `GET /_backup/export`
+  returns); use it when the destination is a pipe or an uploader rather
+  than a file
+- one blob is still one record, so peak memory is at least the size of the
+  largest single attachment; for multi-GB files prefer
   `spec.load(open(...))` on the host over an HTTP upload
 - test restore regularly instead of assuming the archive is enough
 - choose `overwrite` carefully in shared environments

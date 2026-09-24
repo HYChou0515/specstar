@@ -325,6 +325,50 @@ field **or** the archive as a raw `application/octet-stream` body — so the
 export bytes round-trip directly (`--data-binary @dump.acbak`). See [Backup &
 Restore](./backup-restore.md#per-model-import) for `curl` recipes.
 
+The **global** route does not: `POST /_backup/import` takes the multipart
+form field only, and a raw body is a `422` (`body.file: Field required`).
+
+### `dump()` raises on an unreadable blob — by default
+
+`dump()` runs `strict=True`: content the store will not give up raises
+`DumpIncompleteError` instead of being left out of the archive. An unreadable
+blob used to be skipped in silence while the dump reported success, so a short
+archive was indistinguishable from a complete one; a resource whose revision
+data would not read used to die on a bare `KeyError` instead. Pass
+`strict=False` to export what is readable and check the returned per-model
+`DumpStats` — `complete` is the question to ask.
+
+A revision stored at an **older schema version** does not decode under the
+current model, which is a supported state. For a model with no `Binary` field
+nothing is decoded at all and nothing is lost. For one that carries
+attachments it *is* a loss — that revision contributes no blob ids, so its
+attachment never enters the archive — and strict mode refuses, naming it.
+
+Both export routes accept `?strict=false`, but a streamed response has nowhere
+to return the stats: the archive comes back well-formed whatever was skipped
+and `load` accepts it. The server logs a warning; that is the only record.
+
+### A truncated archive is refused, not partially loaded
+
+Cutting an archive at a record boundary leaves whole, decodable records, so
+nothing downstream used to notice: `load()` returned `loaded=0` without
+raising. It now requires the end-of-stream record and now requires the end-of-stream
+record and raises `ArchiveTruncatedError` if the stream ends early — at a
+record boundary or inside a record, on both import routes, always a `400` and
+always carrying the counts that were applied.
+Loading is not transactional — batches already written stay written, and the
+error carries the counts that were applied.
+
+### `access_scope` does not fence a backup
+
+The backup routes are permission-checked against the request's user like every
+other route (`ResourceAction.dump` / `load`, grouped as
+`ResourceAction.backup`); a refusal is a `403`. Two caveats: the default
+checker is `AllowAll()`, so out of the box they are as open as everything else;
+and `access_scope` restricts reads and request-writes only — a user allowed to
+`dump` gets **every** row of that model, not the rows their scope would show.
+Grant the backup actions to operators.
+
 ---
 
 ## GraphQL is opt-in

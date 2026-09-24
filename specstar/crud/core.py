@@ -7,7 +7,7 @@ import logging
 import os
 import warnings
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import (
@@ -21,6 +21,7 @@ from typing import (
 
 if TYPE_CHECKING:
     from specstar.locks import ILockBackend, LockHandle
+    from specstar.resource_manager.dump_format import DumpStats
 
 from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.params import Body
@@ -91,6 +92,7 @@ from specstar.resource_manager.storage_factory import (
 )
 from specstar.schema import Schema
 from specstar.types import (
+    ArchiveTruncatedError,
     IConstraintChecker,
     IMessageQueue,
     IMessageQueueFactory,
@@ -198,10 +200,10 @@ class LoadStats:
 
     __slots__ = ("loaded", "skipped", "total")
 
-    def __init__(self) -> None:
-        self.loaded = 0
-        self.skipped = 0
-        self.total = 0
+    def __init__(self, loaded: int = 0, skipped: int = 0, total: int = 0) -> None:
+        self.loaded = loaded
+        self.skipped = skipped
+        self.total = total
 
     def __repr__(self) -> str:
         return (
@@ -404,6 +406,12 @@ class SpecStar:
         self.model_naming = "kebab"
         self.message_queue_factory = None
         self.route_templates: list[IRouteTemplate] = []
+        # The provider the generated routes resolve ``current_user`` /
+        # ``current_time`` through. Kept here as well as on each route
+        # template because the global ``/_backup/*`` routes are built by
+        # SpecStar itself and have no template to borrow it from — which
+        # is how they ended up binding no identity at all.
+        self._dependency_provider = DependencyProvider()
         self.permission_checker = AllowAll()
         self.event_handlers = None
         self.default_encoding = Encoding.json
@@ -600,6 +608,37 @@ class SpecStar:
 
         if rebuild_templates:
             self.route_templates = []
+
+            # Resolve the effective provider for BOTH branches. The global
+            # ``/_backup/*`` routes are registered by SpecStar itself,
+            # outside ``apply``'s per-model loop, and read it from here —
+            # so computing it only on the dict/unset branch left an
+            # explicit ``route_templates=[...]`` list with those routes
+            # resolving no caller at all, i.e. unauthenticated.
+            #
+            # Falling back to the provider already on the instance (rather
+            # than a fresh one) is what keeps a constructor-supplied
+            # ``get_user`` alive across a later
+            # ``configure(default_user=...)``; ``with_default_user``
+            # returns self when a custom ``get_user`` is set, so a real
+            # authentication dependency still wins.
+            dep_provider = (
+                dependency_provider
+                if dependency_provider is not UNSET
+                else self._dependency_provider
+            )
+
+            # Propagate default_user to the DependencyProvider so that
+            # route handlers receive the configured user instead of
+            # "anonymous" when no custom get_user is set.
+            effective_default_user = (
+                default_user if default_user is not UNSET else self.default_user
+            )
+            if effective_default_user is not UNSET:
+                base_dp = dep_provider or DependencyProvider()
+                dep_provider = base_dp.with_default_user(effective_default_user)
+            self._dependency_provider = dep_provider or DependencyProvider()
+
             if (
                 route_templates is UNSET
                 or route_templates is None
@@ -608,20 +647,6 @@ class SpecStar:
                 route_templates_dict = (
                     route_templates if isinstance(route_templates, dict) else {}
                 )
-                dep_provider = (
-                    dependency_provider if dependency_provider is not UNSET else None
-                )
-
-                # Propagate default_user to the DependencyProvider so that
-                # route handlers receive the configured user instead of
-                # "anonymous" when no custom get_user is set.
-                effective_default_user = (
-                    default_user if default_user is not UNSET else self.default_user
-                )
-                if effective_default_user is not UNSET:
-                    base_dp = dep_provider or DependencyProvider()
-                    dep_provider = base_dp.with_default_user(effective_default_user)
-
                 for rt in [
                     CreateRouteTemplate,
                     ListRouteTemplate,
@@ -3273,12 +3298,27 @@ class SpecStar:
         * ``POST /_backup/import`` — upload a ``.acbak`` archive and
           load its contents into the matching resource managers.
         """
-        import io as _io
-
         from fastapi import Query as _Query
         from fastapi.responses import StreamingResponse
 
+        from specstar.crud.route_templates.exception_handlers import (
+            to_http_exception,
+        )
+
         specstar_ref = self  # closure over self
+        # Bind the request's identity exactly as every generated route
+        # template does. Without this the permission check saw the
+        # spec-level default_user on every call, so a deployment with real
+        # authentication had two open doors (#450 S4).
+        deps = self._dependency_provider
+        # ...but only override the manager's own context when there really
+        # is a caller to resolve. These routes are registered outside
+        # ``apply``'s per-model loop, so ``deps`` never carries a model's
+        # ``add_model(default_user=...)``; forcing its built-in default
+        # here would replace that user with "anonymous" and 403 a service
+        # backup that works today. With no custom ``get_user``, leave the
+        # context unset and let each manager use its own default.
+        _resolves_a_caller = not deps._user_is_default
 
         @router.get(
             "/_backup/export",
@@ -3305,6 +3345,16 @@ class SpecStar:
                     "models are exported."
                 ),
             ),
+            strict: bool = _Query(
+                True,
+                description=(
+                    "Fail the export if a referenced blob or a resource's "
+                    "revision data cannot be read, instead of exporting an "
+                    "archive that is quietly short."
+                ),
+            ),
+            current_user: str = Depends(deps.get_user),
+            current_time: dt.datetime = Depends(deps.get_now),
         ):
             model_queries: dict[str, Query | ResourceMetaSearchQuery | None] | None = (
                 None
@@ -3318,11 +3368,24 @@ class SpecStar:
                     )
                 model_queries = {m: None for m in models}
 
-            buf = _io.BytesIO()
-            specstar_ref.dump(buf, model_queries=model_queries)
-            buf.seek(0)
+            try:
+                # ``iter_dump`` resolves the models and runs every
+                # per-model permission check as it is CALLED, so a refusal
+                # arrives here — as PermissionDeniedError — while the
+                # status code can still be set. Untranslated it became a
+                # 500, which reads as "the library broke" and made the
+                # backup door look unguarded. Nothing is read from storage
+                # until the response starts pulling chunks.
+                chunks = specstar_ref.iter_dump(
+                    model_queries,
+                    strict=strict,
+                    user=current_user if _resolves_a_caller else UNSET,
+                    now=current_time,
+                )
+            except Exception as e:
+                raise to_http_exception(e)
             return StreamingResponse(
-                buf,
+                chunks,
                 media_type="application/octet-stream",
                 headers={
                     "Content-Disposition": 'attachment; filename="backup.acbak"',
@@ -3346,6 +3409,8 @@ class SpecStar:
                 "overwrite",
                 description="Strategy: overwrite | skip | raise_error",
             ),
+            current_user: str = Depends(deps.get_user),
+            current_time: dt.datetime = Depends(deps.get_now),
         ) -> dict:
             try:
                 strategy = OnDuplicate(on_duplicate)
@@ -3363,9 +3428,17 @@ class SpecStar:
             # has to fit in memory here.
             await file.seek(0)
             try:
-                stats = specstar_ref.load(file.file, on_duplicate=strategy)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+                stats = specstar_ref.load(
+                    file.file,
+                    on_duplicate=strategy,
+                    user=current_user if _resolves_a_caller else UNSET,
+                    now=current_time,
+                )
+            except Exception as e:
+                # ValueError (bad archive) still maps to 400 through the
+                # shared mapper; a denied load now maps to 403 instead of
+                # escaping as a 500.
+                raise to_http_exception(e)
 
             return {
                 model: {
@@ -3537,7 +3610,11 @@ class SpecStar:
         self,
         bio: IO[bytes],
         model_queries: dict[str, Query | ResourceMetaSearchQuery | None] | None = None,
-    ) -> None:
+        *,
+        strict: bool = True,
+        user: str | UnsetType = UNSET,
+        now: dt.datetime | UnsetType = UNSET,
+    ) -> dict[str, "DumpStats"]:
         """Export resources to a streaming msgpack archive.
 
         Args:
@@ -3547,6 +3624,21 @@ class SpecStar:
                 When provided, only the listed models are exported;
                 each value is a ``Query`` / ``ResourceMetaSearchQuery``
                 (or *None* for "all resources of that model").
+            strict: When *True* (the default), a referenced blob that
+                cannot be read — or a revision whose payload cannot be
+                decoded — raises :class:`DumpIncompleteError` rather than
+                being left out of the archive in silence. Pass *False* to
+                export what is readable and check the returned stats.
+            user: Who is asking. Defaults to the manager's context, which
+                for an HTTP caller means the route must pass the request's
+                user — the permission check reads this.
+            now: Timestamp for the operation context.
+
+        Returns:
+            Per-model :class:`DumpStats`: how many metas, revisions and
+            blobs were written, and which blobs / revisions were skipped.
+            ``stats[model].complete`` is the one question a backup script
+            should ask.
 
         Example::
 
@@ -3560,16 +3652,53 @@ class SpecStar:
             with open("backup.acbak", "wb") as f:
                 specstar.dump(f, model_queries={"user": QB.name == "Alice"})
         """
-        from specstar.resource_manager.dump_format import (
-            DumpStreamWriter,
-            EofRecord,
-            HeaderRecord,
-            ModelEndRecord,
-            ModelStartRecord,
-        )
+        stats: dict[str, DumpStats] = {}
+        for chunk in self.iter_dump(
+            model_queries, strict=strict, stats=stats, user=user, now=now
+        ):
+            bio.write(chunk)
+        return stats
 
-        writer = DumpStreamWriter(bio)
-        writer.write(HeaderRecord())
+    def iter_dump(
+        self,
+        model_queries: dict[str, Query | ResourceMetaSearchQuery | None] | None = None,
+        *,
+        strict: bool = True,
+        stats: dict[str, "DumpStats"] | None = None,
+        user: str | UnsetType = UNSET,
+        now: dt.datetime | UnsetType = UNSET,
+    ) -> Iterator[bytes]:
+        """Produce the same archive as :meth:`dump`, as byte chunks.
+
+        Use this where the destination is not a file — an HTTP response,
+        a pipe, an uploader — so the archive never has to exist in memory
+        all at once.
+
+        Model resolution and the per-model permission check happen **when
+        this is called**, not at the first ``next()``: a refusal or an
+        unknown model name must be able to change an HTTP status code,
+        which is impossible once the first byte has been sent. The
+        consequence is that every model's ``BeforeDump`` fires up front
+        rather than interleaved with the writing.
+
+        Args:
+            model_queries: As :meth:`dump`.
+            strict: As :meth:`dump`.
+            stats: Optional dict to fill with per-model
+                :class:`DumpStats` — the return value has nowhere to go
+                on a generator, so pass one in if you need the counts.
+            user: Who is asking; each model's ``dump`` is called inside
+                ``using(user, now)`` so the permission check sees the
+                request's caller rather than the spec-level default.
+            now: Timestamp for the operation context.
+
+        Yields:
+            Length-prefixed frames, in archive order.
+        """
+        from specstar.resource_manager.dump_format import DumpStats
+
+        if stats is None:
+            stats = {}
 
         # Determine which models to dump
         if model_queries is None:
@@ -3577,18 +3706,77 @@ class SpecStar:
         else:
             models_to_dump = model_queries
 
-        for model_name, query in models_to_dump.items():
+        # Eager: resolve every model and open every record generator now.
+        # ``execute_with_events`` wraps ``dump`` in a plain function, so
+        # calling it runs the permission check even though the body is a
+        # generator — which is exactly what lets a refusal become a 403
+        # before the response commits.
+        # Resolve every name first. Opening a generator fires that model's
+        # dump events, so validating inside the same loop meant an unknown
+        # name at the end logged the earlier models as dumped and then
+        # exported nothing.
+        for model_name in models_to_dump:
             if model_name not in self.resource_managers:
                 raise ValueError(
                     f"Model '{model_name}' not found in resource managers."
                 )
-            mgr = self.resource_managers[model_name]
-            writer.write(ModelStartRecord(model_name=model_name))
-            for record in mgr.dump(query=query):
-                writer.write(record)
-            writer.write(ModelEndRecord(model_name=model_name))
 
-        writer.write(EofRecord())
+        sections: list[tuple[str, Iterator[Any]]] = []
+        for model_name, query in models_to_dump.items():
+            model_stats = DumpStats()
+            stats[model_name] = model_stats
+            mgr = self.resource_managers[model_name]
+            # The context has to be entered around the CALL, which is
+            # where the permission check runs. The generator body executes
+            # later, outside it, and performs only internal reads.
+            with mgr.using(user, now):
+                sections.append(
+                    (
+                        model_name,
+                        mgr.dump(query=query, strict=strict, stats=model_stats),
+                    )
+                )
+
+        return self._iter_dump_frames(sections, stats)
+
+    @staticmethod
+    def _iter_dump_frames(
+        sections: "list[tuple[str, Iterator[Any]]]",
+        stats: "dict[str, DumpStats]",
+    ) -> Iterator[bytes]:
+        from specstar.resource_manager.dump_format import (
+            EofRecord,
+            HeaderRecord,
+            ModelEndRecord,
+            ModelStartRecord,
+            encode_frame,
+        )
+
+        yield encode_frame(HeaderRecord())
+        for model_name, records in sections:
+            yield encode_frame(ModelStartRecord(model_name=model_name))
+            for record in records:
+                yield encode_frame(record)
+            yield encode_frame(ModelEndRecord(model_name=model_name))
+        yield encode_frame(EofRecord())
+
+        # A non-strict export ends with a well-formed archive whatever it
+        # skipped: every truncation check passes, ``load`` accepts it and
+        # reports full success. The caller of ``dump`` reads that off the
+        # returned stats — a streaming HTTP caller has nowhere to read it,
+        # so the operator's only record is this line.
+        for model_name, model_stats in stats.items():
+            if not model_stats.complete:
+                logger.warning(
+                    "dump of %r finished incomplete: %d blob(s) unreadable, "
+                    "%d resource(s) without revision data, %d revision(s) "
+                    "whose blob references could not be read. The archive is "
+                    "well-formed and will restore without complaint.",
+                    model_name,
+                    len(model_stats.skipped_blobs),
+                    len(model_stats.unreadable_resources),
+                    len(model_stats.undecodable_revisions),
+                )
 
     def load(
         self,
@@ -3597,6 +3785,8 @@ class SpecStar:
         *,
         batch_size: int = 1000,
         batch_bytes: int = 64 * 1024 * 1024,
+        user: str | UnsetType = UNSET,
+        now: dt.datetime | UnsetType = UNSET,
     ) -> dict[str, "LoadStats"]:
         """Import resources from a streaming msgpack archive.
 
@@ -3616,6 +3806,10 @@ class SpecStar:
             batch_size: Records per write batch.
             batch_bytes: Payload bytes per write batch (blob-heavy archives
                 hit this bound first).
+            user: Who is asking; each batch is written inside
+                ``using(user, now)`` so the permission check sees the
+                request's caller rather than the spec-level default.
+            now: Timestamp for the operation context.
 
         Returns:
             Per-model load statistics: ``{model_name: LoadStats}``.
@@ -3651,6 +3845,7 @@ class SpecStar:
 
         current_model: str | None = None
         current_mgr = None
+        saw_eof = False
         # Record buffers for the batch being assembled, and the ids skipped
         # so far in this model section (a skipped resource's revisions may
         # arrive in a later batch and must be skipped too).
@@ -3665,13 +3860,14 @@ class SpecStar:
             if current_mgr is None or current_model is None:
                 return
             if meta_buf or rev_buf or blob_buf:
-                st = current_mgr.load_records_bulk(
-                    meta_buf,
-                    rev_buf,
-                    blob_buf,
-                    on_duplicate=on_duplicate,
-                    skipped_ids=skipped_ids,
-                )
+                with current_mgr.using(user, now):
+                    st = current_mgr.load_records_bulk(
+                        meta_buf,
+                        rev_buf,
+                        blob_buf,
+                        on_duplicate=on_duplicate,
+                        skipped_ids=skipped_ids,
+                    )
                 s = stats[current_model]
                 s.loaded += st.loaded
                 s.skipped += st.skipped
@@ -3693,7 +3889,21 @@ class SpecStar:
             ):
                 flush()
 
-        for record in reader:
+        # The frame reader raises on a stream cut INSIDE a record — the
+        # realistic truncation, since a killed dump lands on a frame
+        # boundary only by luck. Draining it through this wrapper keeps
+        # the catch scoped to the reader (a ValueError raised by the loop
+        # body, e.g. an unknown model, still propagates as itself) so the
+        # final flush below still runs and the error still carries stats.
+        reader_error: list[Exception] = []
+
+        def _frames():
+            try:
+                yield from reader
+            except ValueError as e:
+                reader_error.append(e)
+
+        for record in _frames():
             if isinstance(record, ModelStartRecord):
                 current_model = record.model_name
                 if current_model not in self.resource_managers:
@@ -3720,6 +3930,17 @@ class SpecStar:
                 buffer(blob_buf, record, len(record.blob_data))
 
             elif isinstance(record, EofRecord):
+                saw_eof = True
                 break
 
+        # Flush whatever the last (possibly unterminated) section left
+        # buffered before judging the stream: those records are whole and
+        # decodable, and dropping them is the silent loss this guard exists
+        # to stop. A complete archive already flushed at its ModelEndRecord,
+        # so this is a no-op for it.
+        flush()
+        if reader_error:
+            raise ArchiveTruncatedError(stats) from reader_error[0]
+        if not saw_eof:
+            raise ArchiveTruncatedError(stats)
         return stats

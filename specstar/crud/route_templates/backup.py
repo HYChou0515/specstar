@@ -9,11 +9,20 @@ Two templates are provided:
   ``.acbak`` archive and loads it into the datastore.
 """
 
+import datetime as dt
 import io
 import textwrap
 from typing import IO, TypeVar
 
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 
 from specstar.crud.route_templates.basic import (
@@ -23,11 +32,32 @@ from specstar.crud.route_templates.basic import (
 )
 from specstar.crud.route_templates.exception_handlers import to_http_exception
 from specstar.types import (
+    ArchiveTruncatedError,
     IResourceManager,
     OnDuplicate,
 )
 
 T = TypeVar("T")
+
+
+class ExportQueryInputs(QueryInputs):
+    """Search filters plus the export-only ``strict`` switch.
+
+    A separate ``strict: bool = Query(...)`` parameter cannot be mixed
+    with a Pydantic query-parameter model — FastAPI then stops expanding
+    the model and asks for a literal ``query_params`` — so the switch is
+    a field here, exactly as ``returns`` is on
+    :class:`QueryInputsWithReturns`.
+    """
+
+    strict: bool = Query(
+        True,
+        description=(
+            "Fail the export if a referenced blob or a resource's revision "
+            "data cannot be read, instead of returning an archive that is "
+            "quietly short. Set false to export what is readable."
+        ),
+    )
 
 
 # ======================================================================
@@ -77,14 +107,16 @@ class ExportRouteTemplate(BaseRouteTemplate):
         )
         async def export_model(
             request: Request,
-            query_params: QueryInputs = Query(...),
+            query_params: ExportQueryInputs = Query(...),
+            current_user: str = Depends(self.deps.get_user),
+            current_time: dt.datetime = Depends(self.deps.get_now),
         ) -> StreamingResponse:
             from specstar.resource_manager.dump_format import (
-                DumpStreamWriter,
                 EofRecord,
                 HeaderRecord,
                 ModelEndRecord,
                 ModelStartRecord,
+                encode_frame,
             )
 
             # Build optional filter (None → dump everything)
@@ -95,19 +127,36 @@ class ExportRouteTemplate(BaseRouteTemplate):
                 except Exception as e:
                     raise to_http_exception(e)
 
-            buf = io.BytesIO()
-            writer = DumpStreamWriter(buf)
-            writer.write(HeaderRecord())
-            writer.write(ModelStartRecord(model_name=model_name))
-            for record in resource_manager.dump(query=query_for_dump):
-                writer.write(record)
-            writer.write(ModelEndRecord(model_name=model_name))
-            writer.write(EofRecord())
+            try:
+                # ``execute_with_events`` wraps ``dump`` in a plain
+                # function, so calling it runs the permission check even
+                # though the body is a generator — a refusal reaches here
+                # while the status code can still be set. An untranslated
+                # one left as a 500. The context must be entered around
+                # this CALL, not around the generator body, for the same
+                # reason: that is where the check runs.
+                with resource_manager.using(current_user, current_time):
+                    records = resource_manager.dump(
+                        query=query_for_dump, strict=query_params.strict
+                    )
+            except Exception as e:
+                raise to_http_exception(e)
 
-            buf.seek(0)
+            def frames():
+                # Framed as we go: the archive is never assembled whole.
+                # A failure once the response has started (a strict dump
+                # meeting an unreadable blob) truncates it, and a
+                # truncated archive is what ``load`` refuses.
+                yield encode_frame(HeaderRecord())
+                yield encode_frame(ModelStartRecord(model_name=model_name))
+                for record in records:
+                    yield encode_frame(record)
+                yield encode_frame(ModelEndRecord(model_name=model_name))
+                yield encode_frame(EofRecord())
+
             filename = f"{model_name}.acbak"
             return StreamingResponse(
-                buf,
+                frames(),
                 media_type="application/octet-stream",
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',
@@ -179,6 +228,8 @@ class ImportRouteTemplate(BaseRouteTemplate):
                 "overwrite",
                 description="Strategy: overwrite | skip | raise_error",
             ),
+            current_user: str = Depends(self.deps.get_user),
+            current_time: dt.datetime = Depends(self.deps.get_now),
         ) -> dict:
             from specstar.resource_manager.dump_format import (
                 BlobRecord,
@@ -225,6 +276,12 @@ class ImportRouteTemplate(BaseRouteTemplate):
                         "field or as a raw application/octet-stream body."
                     ),
                 )
+            except Exception as e:
+                # Only StopIteration was caught here, so a malformed or
+                # mid-frame stream — the ordinary "upload stopped early" —
+                # left the reader's ValueError to escape as a 500. The
+                # global route already answered 400 for the same input.
+                raise to_http_exception(e)
             if not isinstance(first, HeaderRecord):
                 raise HTTPException(
                     status_code=400,
@@ -244,45 +301,94 @@ class ImportRouteTemplate(BaseRouteTemplate):
             total = 0
             skipped_ids: set[str] = set()
             in_target_section = False
+            saw_eof = False
 
-            for record in reader:
-                if isinstance(record, ModelStartRecord):
-                    in_target_section = record.model_name == model_name
+            # Every write below is permission-checked against this
+            # user; without the context it was the spec-level default.
+            with resource_manager.using(current_user, current_time):
+                try:
+                    for record in reader:
+                        if isinstance(record, ModelStartRecord):
+                            in_target_section = record.model_name == model_name
 
-                elif isinstance(record, ModelEndRecord):
-                    in_target_section = False
+                        elif isinstance(record, ModelEndRecord):
+                            in_target_section = False
 
-                elif isinstance(record, MetaRecord):
-                    if not in_target_section:
-                        continue
-                    total += 1
-                    try:
-                        ok = resource_manager.load_record(record, strategy)
-                    except Exception as e:
-                        raise HTTPException(status_code=409, detail=str(e))
-                    if ok:
-                        loaded += 1
-                    else:
-                        skipped += 1
-                        # Decode meta to track skipped resource ids so we
-                        # can skip their revisions too.
-                        meta = resource_manager.meta_serializer.decode(record.data)  # ty:ignore[unresolved-attribute]
-                        skipped_ids.add(meta.resource_id)
+                        elif isinstance(record, MetaRecord):
+                            if not in_target_section:
+                                continue
+                            total += 1
+                            try:
+                                ok = resource_manager.load_record(record, strategy)
+                            except Exception as e:
+                                # Was a blanket 409: it turned a permission refusal
+                                # into "conflict" and every storage failure into one
+                                # too. The shared mapper keeps the real conflicts at
+                                # 409 and sends a refusal to 403.
+                                raise to_http_exception(e)
+                            if ok:
+                                loaded += 1
+                            else:
+                                skipped += 1
+                                # Decode meta to track skipped resource ids so we
+                                # can skip their revisions too.
+                                meta = resource_manager.meta_serializer.decode(
+                                    record.data
+                                )  # ty:ignore[unresolved-attribute]
+                                skipped_ids.add(meta.resource_id)
 
-                elif isinstance(record, RevisionRecord):
-                    if not in_target_section:
-                        continue
-                    raw = resource_manager.resource_serializer.decode(record.data)  # ty:ignore[unresolved-attribute]
-                    if raw.info.resource_id in skipped_ids:
-                        continue
-                    resource_manager.load_record(record, strategy)
+                        elif isinstance(record, RevisionRecord):
+                            if not in_target_section:
+                                continue
+                            raw = resource_manager.resource_serializer.decode(
+                                record.data
+                            )  # ty:ignore[unresolved-attribute]
+                            if raw.info.resource_id in skipped_ids:
+                                continue
+                            try:
+                                resource_manager.load_record(record, strategy)
+                            except Exception as e:
+                                raise to_http_exception(e)
 
-                elif isinstance(record, BlobRecord):
-                    if not in_target_section:
-                        continue
-                    resource_manager.load_record(record, strategy)
+                        elif isinstance(record, BlobRecord):
+                            if not in_target_section:
+                                continue
+                            try:
+                                resource_manager.load_record(record, strategy)
+                            except Exception as e:
+                                raise to_http_exception(e)
 
-                elif isinstance(record, EofRecord):
-                    break
+                        elif isinstance(record, EofRecord):
+                            saw_eof = True
+                            break
+                except ValueError as e:
+                    # The frame reader raises a plain ValueError on a
+                    # stream cut inside a record — the ordinary
+                    # "upload stopped early". Report it as the truncation
+                    # it is, carrying the counts already applied, so both
+                    # cut shapes and both import routes answer alike.
+                    from specstar.crud.core import LoadStats
+
+                    raise to_http_exception(
+                        ArchiveTruncatedError(
+                            {model_name: LoadStats(loaded, skipped, total)}
+                        )
+                    ) from e
+                except Exception as e:
+                    raise to_http_exception(e)
+
+            # No EofRecord means the upload was cut short. Every record
+            # before the cut is already applied (load_record writes as it
+            # reads), so this reports the truncation rather than undoing it
+            # — but it must report it: a silent 200 here is a restore that
+            # only looks complete.
+            if not saw_eof:
+                from specstar.crud.core import LoadStats
+
+                raise to_http_exception(
+                    ArchiveTruncatedError(
+                        {model_name: LoadStats(loaded, skipped, total)}
+                    )
+                )
 
             return {"loaded": loaded, "skipped": skipped, "total": total}

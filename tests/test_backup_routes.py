@@ -13,7 +13,7 @@ import datetime as dt
 import io
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from msgspec import Struct
 
@@ -490,3 +490,189 @@ class TestOpenAPISchemaGeneration:
         paths = schema.get("paths", {})
         assert "/_backup/export" in paths
         assert "/_backup/import" in paths
+
+
+# ======================================================================
+# Authorization (issue #450)
+# ======================================================================
+
+
+def _locked_app() -> tuple[SpecStar, TestClient, bytes]:
+    """An app with real authentication, seeded with a secret.
+
+    ``default_user`` is the PRIVILEGED name on purpose. A backup route
+    that never binds the request's identity is checked against that
+    default and lets an anonymous caller straight through — which is what
+    #450 reported and what an earlier version of these tests missed by
+    making the default user the denied one.
+
+    Returns the spec, a client that surfaces a 500 instead of raising, and
+    a valid archive produced by a permissive twin, so the import tests
+    exercise the permission check rather than a parse failure.
+    """
+    from specstar.crud.route_templates.dependency_provider import DependencyProvider
+    from specstar.permission.simple import RootOnly
+
+    donor = SpecStar(default_user="root", default_now=dt.datetime.now)
+    donor.add_model(Item, name="item")
+    _seed(donor, "item", [Item(name="donor", price=1)])
+    buf = io.BytesIO()
+    donor.dump(buf)
+
+    def get_user(request: Request) -> str:
+        return request.headers.get("X-User", "anon")
+
+    spec = SpecStar(
+        default_user="root",
+        default_now=dt.datetime.now,
+        permission_checker=RootOnly(root_user="root"),
+        dependency_provider=DependencyProvider(get_user=get_user),
+    )
+    spec.add_model(Item, name="item")
+    with spec.resource_managers["item"].using(user="root", now=dt.datetime.now()):
+        spec.resource_managers["item"].create(Item(name="TOP-SECRET-XYZ", price=99))
+    app = FastAPI()
+    spec.apply(app)
+    return spec, TestClient(app, raise_server_exceptions=False), buf.getvalue()
+
+
+ANON = {"X-User": "anon"}
+ROOT = {"X-User": "root"}
+
+
+class TestBackupAuthorization:
+    """The backup doors answer 403 to a caller the checker denies.
+
+    Two bugs sat on top of each other here. The routes bound no identity
+    at all, so ``ResourceManager``'s permission check — real, and reached
+    from every caller — ran against the spec-level ``default_user``
+    rather than whoever called; with real authentication wired up, an
+    anonymous client downloaded the whole datastore. And when the check
+    did deny, none of the four routes translated the refusal: global
+    export/import let it escape as a 500, per-model import caught it in a
+    blanket handler and called it a 409.
+
+    So these assert both halves: the door is keyed to the *caller*, and a
+    refusal reads as 403.
+    """
+
+    def test_a_normal_route_is_keyed_to_the_caller(self):
+        """The control: every other route already does this correctly."""
+        _, client, _ = _locked_app()
+
+        assert client.get("/item", headers=ANON).status_code == 403
+        assert client.get("/item", headers=ROOT).status_code == 200
+
+    def test_global_export_is_keyed_to_the_caller(self):
+        _, client, _ = _locked_app()
+
+        resp = client.get("/_backup/export", headers=ANON)
+
+        assert resp.status_code == 403
+        assert b"TOP-SECRET-XYZ" not in resp.content
+
+    def test_per_model_export_is_keyed_to_the_caller(self):
+        _, client, _ = _locked_app()
+
+        resp = client.get("/item/export", headers=ANON)
+
+        assert resp.status_code == 403
+        assert b"TOP-SECRET-XYZ" not in resp.content
+
+    def test_global_import_is_keyed_to_the_caller(self):
+        _, client, archive = _locked_app()
+
+        resp = client.post(
+            "/_backup/import", files={"file": ("x.acbak", archive)}, headers=ANON
+        )
+
+        assert resp.status_code == 403
+
+    def test_per_model_import_is_keyed_to_the_caller(self):
+        """Was a 409: a blanket ``except Exception`` called a refusal a conflict."""
+        _, client, archive = _locked_app()
+
+        resp = client.post(
+            "/item/import", files={"file": ("x.acbak", archive)}, headers=ANON
+        )
+
+        assert resp.status_code == 403
+
+    def test_the_permitted_caller_still_gets_through(self):
+        """The check must key on the caller, not simply refuse everyone."""
+        _, client, archive = _locked_app()
+
+        assert client.get("/_backup/export", headers=ROOT).status_code == 200
+        assert client.get("/item/export", headers=ROOT).status_code == 200
+        assert (
+            client.post(
+                "/item/import", files={"file": ("x.acbak", archive)}, headers=ROOT
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/_backup/import", files={"file": ("x.acbak", archive)}, headers=ROOT
+            ).status_code
+            == 200
+        )
+
+    def test_a_per_model_default_user_still_reaches_the_global_routes(self):
+        """No HTTP auth configured → each model keeps its own default user.
+
+        `apply()` hands every route template a provider carrying that
+        model's `default_user`, but the global `/_backup/*` routes are
+        built outside that loop. Binding them to the spec-level provider
+        unconditionally made them run as `"anonymous"`, which *overrode*
+        the manager's own default and turned a working service backup
+        into a 403.
+        """
+        from specstar.permission.simple import RootOnly
+
+        spec = SpecStar(
+            default_now=dt.datetime.now,
+            permission_checker=RootOnly(root_user="svc"),
+        )
+        spec.add_model(Item, name="item", default_user="svc")
+        app = FastAPI()
+        spec.apply(app)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        assert client.get("/item").status_code == 200
+        assert client.get("/item/export").status_code == 200
+        assert client.get("/_backup/export").status_code == 200
+
+    def test_an_explicit_route_templates_list_still_binds_the_caller(self):
+        """`route_templates=[...]` must not reopen the door.
+
+        `configure` only assigned the effective `DependencyProvider` on
+        the dict/unset branch, so an explicit list left the global
+        `/_backup/*` routes on the built-in provider — no caller resolved,
+        each manager falling back to its own default. An unauthenticated
+        client could download and overwrite the whole datastore while the
+        per-model routes correctly refused.
+        """
+        from specstar.crud.route_templates.dependency_provider import (
+            DependencyProvider,
+        )
+        from specstar.crud.route_templates.search import ListRouteTemplate
+        from specstar.permission.simple import RootOnly
+
+        def get_user(request: Request) -> str:
+            return request.headers.get("X-User", "anon")
+
+        provider = DependencyProvider(get_user=get_user)
+        spec = SpecStar(
+            default_user="root",
+            default_now=dt.datetime.now,
+            permission_checker=RootOnly(root_user="root"),
+            dependency_provider=provider,
+            route_templates=[ListRouteTemplate(dependency_provider=provider)],
+        )
+        spec.add_model(Item, name="item")
+        app = FastAPI()
+        spec.apply(app)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        assert client.get("/_backup/export", headers=ANON).status_code == 403
+        assert client.get("/_backup/export", headers=ROOT).status_code == 200
