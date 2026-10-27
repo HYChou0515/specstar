@@ -267,6 +267,27 @@ rm.switch(resource_id, old_revision_id)
 
 ---
 
+### Upgrading past 0.13.0a4 builds the base indexes on Postgres boot
+
+| Intuitive guess | Actual behavior |
+|-----------------|-----------------|
+| An upgrade with no schema change boots as fast as before | The first boot of an existing table may build up to eleven indexes |
+
+Up to 0.13.0a4 the base meta indexes (the `indexed_data` GIN, `is_deleted`,
+`created_*`, `updated_*`, `rev_*`) had fixed names, so in a schema with several
+tables only the first one got them — every other table's `==` / `in_` filters
+scanned every row. Each table now names its own, and on boot an existing table
+gets what it lacks with `CREATE INDEX CONCURRENTLY`: writes go on, but on a large
+table the boot waits for the build. Build them beforehand with
+`base_index_statements()` (see
+[Storage format](../reference/storage-format.md#postgres-postgresmetastore)) and
+the boot finds them and builds nothing.
+
+Finish the rollout before relying on it: an old-version process that boots after
+an upgraded one (a crash restart, a rollback) builds the fixed-name indexes again,
+non-concurrently, on the first table it opens — blocking that table's writes until
+its startup transaction commits. The next upgraded boot drops those copies.
+
 ## Configuration
 
 ### `configure(admin=...)` sets the RBAC root **user name**, not a URL path

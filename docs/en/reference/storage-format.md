@@ -93,15 +93,42 @@ CREATE TABLE "{table_name}" (
     rev_updated_time   TIMESTAMP
 );
 
-CREATE INDEX idx_created_time     ON "{table_name}"(created_time);
-CREATE INDEX idx_updated_time     ON "{table_name}"(updated_time);
-CREATE INDEX idx_created_by       ON "{table_name}"(created_by);
-CREATE INDEX idx_updated_by       ON "{table_name}"(updated_by);
-CREATE INDEX idx_is_deleted       ON "{table_name}"(is_deleted);
-CREATE INDEX idx_rev_*            ON "{table_name}"(rev_*);
-CREATE INDEX idx_indexed_data_gin ON "{table_name}" USING GIN (indexed_data);
+CREATE INDEX "idx_{table_name}_created_time"     ON "{table_name}"(created_time);
+CREATE INDEX "idx_{table_name}_updated_time"     ON "{table_name}"(updated_time);
+CREATE INDEX "idx_{table_name}_created_by"       ON "{table_name}"(created_by);
+CREATE INDEX "idx_{table_name}_updated_by"       ON "{table_name}"(updated_by);
+CREATE INDEX "idx_{table_name}_is_deleted"       ON "{table_name}"(is_deleted);
+CREATE INDEX "idx_{table_name}_rev_*"            ON "{table_name}"(rev_*);
+CREATE INDEX "idx_{table_name}_indexed_data_gin" ON "{table_name}" USING GIN (indexed_data);
 -- plus pgvector vector(N) + HNSW indices for Vector fields (created on demand)
 ```
+
+Each name carries its table (`base_index_name`; past Postgres's 63 bytes the
+table part is cut and a digest of the full name keeps it distinct). Up to
+0.13.0a4 the names were fixed (`idx_indexed_data_gin`, `idx_is_deleted`, …) —
+and an index name shares its schema's relation namespace with every table and
+index in it, so in a schema with several tables only the first got them: every
+other table's `==` / `in_` filters scanned every row. On boot an existing table
+now gets what it lacks: the first table's fixed-name indexes are renamed, the
+others' are built with `CREATE INDEX CONCURRENTLY` (the table keeps taking
+writes; a failed build is logged, never raised). On a large table that build is
+long and runs on the boot path, so build them before upgrading — one statement at
+a time, as the table's owner:
+
+```python
+import psycopg2
+from specstar.resource_manager.meta_store.postgres import base_index_statements
+
+conn = psycopg2.connect(dsn)
+conn.autocommit = True  # CONCURRENTLY refuses a transaction
+with conn.cursor() as cur:
+    for sql in base_index_statements("my_table_meta"):
+        cur.execute(sql)
+```
+
+The upgraded boot then builds nothing; on the table that held the fixed names it
+drops the fixed-name copies the statements were built beside. A build killed midway leaves
+an INVALID index under its name, which the boot drops and builds again.
 
 `table_name` defaults to `resource_meta` and is customisable per
 manager. **`data` is the source of truth**: if you read `data` and

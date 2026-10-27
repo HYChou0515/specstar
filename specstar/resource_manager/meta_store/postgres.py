@@ -65,7 +65,7 @@ def _gin_probeable(condition: "DataSearchFilter", value: Any) -> bool:
 
 
 def _containment(field_path: str, value: Any) -> tuple[str, list]:
-    """A top-level containment probe, served by ``idx_indexed_data_gin``.
+    """A top-level containment probe, served by the table's ``indexed_data`` GIN.
 
     The value is encoded with :func:`json.dumps` — symmetric with the write path
     (``_meta_row_values``) — so its JSON type survives. This matters: ``@>`` is
@@ -118,6 +118,108 @@ _TRGM_COARSE_OPS = frozenset(
 
 
 logger = logging.getLogger(__name__)
+
+#: The base indexes every meta table carries: (name suffix, the fixed name
+#: 0.13.0a4 and earlier gave it, what follows ``ON "table"``, how
+#: ``pg_get_indexdef`` ends for it).
+#:
+#: Their names used to be those fixed names. An index name shares its schema's
+#: relation namespace with every table, view and index in it, and the DDL said
+#: ``IF NOT EXISTS`` — so in a schema holding several SpecStar tables the first
+#: table took every name and each later table got a NOTICE and no index: its
+#: ``==`` / ``in_`` probes, which only this GIN serves (#416), scanned every row.
+#: A name is now per table (:func:`base_index_name`). The last element tells a
+#: fixed-name index SpecStar built from someone's own index that merely shares the
+#: name: only the former is renamed or dropped.
+BASE_INDEXES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "created_time",
+        "idx_created_time",
+        "(created_time)",
+        "USING btree (created_time)",
+    ),
+    (
+        "updated_time",
+        "idx_updated_time",
+        "(updated_time)",
+        "USING btree (updated_time)",
+    ),
+    ("created_by", "idx_created_by", "(created_by)", "USING btree (created_by)"),
+    ("updated_by", "idx_updated_by", "(updated_by)", "USING btree (updated_by)"),
+    ("is_deleted", "idx_is_deleted", "(is_deleted)", "USING btree (is_deleted)"),
+    ("rev_status", "idx_rev_status", "(rev_status)", "USING btree (rev_status)"),
+    (
+        "rev_created_by",
+        "idx_rev_created_by",
+        "(rev_created_by)",
+        "USING btree (rev_created_by)",
+    ),
+    (
+        "rev_updated_by",
+        "idx_rev_updated_by",
+        "(rev_updated_by)",
+        "USING btree (rev_updated_by)",
+    ),
+    (
+        "rev_created_time",
+        "idx_rev_created_time",
+        "(rev_created_time)",
+        "USING btree (rev_created_time)",
+    ),
+    (
+        "rev_updated_time",
+        "idx_rev_updated_time",
+        "(rev_updated_time)",
+        "USING btree (rev_updated_time)",
+    ),
+    (
+        "indexed_data_gin",
+        "idx_indexed_data_gin",
+        "USING GIN (indexed_data)",
+        "USING gin (indexed_data)",
+    ),
+)
+
+#: Postgres truncates a longer identifier with no more than a NOTICE, which would
+#: make two long table names sharing their first 63 bytes collide again.
+_PG_IDENTIFIER_BYTES = 63
+
+
+def base_index_name(table_name: str, suffix: str) -> str:
+    """The name of ``table_name``'s base index ``suffix`` (see :data:`BASE_INDEXES`).
+
+    ``idx_{table}_{suffix}``; when that is longer than Postgres's 63 bytes, the
+    table part is cut and an 8-hex digest of the WHOLE table name keeps it
+    distinct. Deterministic, so pods agree and :func:`base_index_statements`
+    builds exactly what a boot looks for.
+    """
+    name = f"idx_{table_name}_{suffix}"
+    if len(name.encode()) <= _PG_IDENTIFIER_BYTES:
+        return name
+    import hashlib
+
+    tail = (
+        f"_{hashlib.blake2b(table_name.encode(), digest_size=4).hexdigest()}_{suffix}"
+    )
+    room = _PG_IDENTIFIER_BYTES - len("idx_") - len(tail.encode())
+    head = table_name.encode()[: max(room, 0)].decode("utf-8", "ignore")
+    return f"idx_{head}{tail}"
+
+
+def base_index_statements(table_name: str) -> list[str]:
+    """``CREATE INDEX CONCURRENTLY`` for each of ``table_name``'s base indexes.
+
+    For building them ahead of an upgrade, while the old version serves: run them
+    one at a time (``CONCURRENTLY`` refuses a transaction) as the table's owner,
+    and the upgraded boot finds every index and builds nothing. A build killed
+    midway leaves an INVALID index under its name; the boot drops and rebuilds
+    those.
+    """
+    return [
+        f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{base_index_name(table_name, suffix)}" '
+        f'ON "{table_name}" {ddl}'
+        for suffix, _, ddl, _ in BASE_INDEXES
+    ]
 
 
 def _condition_has_trigram(cond: object) -> bool:
@@ -911,6 +1013,8 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
     def _init_postgres_table(self):
         """初始化 PostgreSQL 表結構"""
         with self.transaction() as cur:
+            cur.execute("SELECT to_regclass(%s)", [f'"{self.table_name}"'])
+            existed = cur.fetchone()[0] is not None
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS "{self.table_name}" (
                     resource_id TEXT PRIMARY KEY,
@@ -969,39 +1073,137 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
                         f'ALTER TABLE "{self.table_name}" ADD COLUMN {col_name} {col_type}'
                     )
 
-            # 創建索引
-            cur.execute(
-                f'CREATE INDEX IF NOT EXISTS idx_created_time ON "{self.table_name}"(created_time)',
-            )
-            cur.execute(
-                f'CREATE INDEX IF NOT EXISTS idx_updated_time ON "{self.table_name}"(updated_time)',
-            )
-            cur.execute(
-                f'CREATE INDEX IF NOT EXISTS idx_created_by ON "{self.table_name}"(created_by)',
-            )
-            cur.execute(
-                f'CREATE INDEX IF NOT EXISTS idx_updated_by ON "{self.table_name}"(updated_by)',
-            )
-            cur.execute(
-                f'CREATE INDEX IF NOT EXISTS idx_is_deleted ON "{self.table_name}"(is_deleted)',
-            )
-            for col_name in (
-                "rev_status",
-                "rev_created_by",
-                "rev_updated_by",
-                "rev_created_time",
-                "rev_updated_time",
-            ):
-                cur.execute(
-                    f'CREATE INDEX IF NOT EXISTS idx_{col_name} ON "{self.table_name}"({col_name})'
-                )
-            # 為 JSONB 創建 GIN 索引以提高查詢效能
-            cur.execute(
-                f'CREATE INDEX IF NOT EXISTS idx_indexed_data_gin ON "{self.table_name}" USING GIN (indexed_data)',
-            )
+            if not existed:
+                # An empty table: building them here costs nothing, and a table
+                # created by this process has them before its first row.
+                for suffix, _, ddl, _ in BASE_INDEXES:
+                    name = base_index_name(self.table_name, suffix)
+                    cur.execute(
+                        f'CREATE INDEX IF NOT EXISTS "{name}" ON "{self.table_name}" {ddl}'
+                    )
 
             # 遷移已存在的記錄，填充 indexed_data
             self._migrate_existing_data(cur)
+        if existed:
+            self._ensure_base_indexes()
+
+    def _ensure_base_indexes(self) -> None:
+        """Best-effort: give an existing table every base index it lacks.
+
+        A table built by 0.13.0a4 or earlier either holds the fixed names (the
+        first table in its schema) or has no base index at all (every other one).
+        The first are RENAMED — instant, and no second copy of each index; the
+        rest are built ``CONCURRENTLY``, so the table keeps taking writes. Like
+        :meth:`_build_sort_index_ddl`: an advisory lock elects one builder of THESE
+        indexes among pods booting together, and no failure leaves this method — a
+        missing index costs speed, never correctness, so it must never cost a boot.
+        The lock does not cover another pod's sort / set / trigram build on the same
+        table, which can still deadlock with ours and kill one statement: each
+        index is therefore tried on its own, so one lost statement skips only its
+        own index until the next boot. A build killed midway leaves an INVALID
+        index under the new name; it is dropped and built again.
+        """
+        try:
+            self._try_ensure_base_indexes()
+        except Exception:
+            logger.warning(
+                "base indexes on %r could not all be built; queries stay correct "
+                "but unaccelerated until a later boot completes them "
+                "(base_index_statements() builds them by hand)",
+                self.table_name,
+                exc_info=True,
+            )
+
+    def _try_ensure_base_indexes(self) -> None:
+        """The DDL itself. Raises; :meth:`_ensure_base_indexes` is the guard."""
+        lock_key = self._advisory_key(f"base_indexes:{self.table_name}")
+        conn = psycopg2.connect(self._pg_dsn)
+        conn.autocommit = True  # CONCURRENTLY cannot run inside a transaction
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", [lock_key])
+                if not cur.fetchone()[0]:
+                    return  # another pod is on it; ours would only deadlock
+                try:
+                    self._complete_base_indexes(cur)
+                finally:
+                    try:
+                        cur.execute("SELECT pg_advisory_unlock(%s)", [lock_key])
+                    except Exception:
+                        logger.debug(
+                            "advisory unlock for the base indexes of %r failed; the "
+                            "closing connection releases it",
+                            self.table_name,
+                            exc_info=True,
+                        )
+        finally:
+            conn.close()
+
+    def _complete_base_indexes(self, cur) -> None:
+        cur.execute(
+            "SELECT c.relname, i.indisvalid, i.indisunique, "
+            "pg_get_indexdef(i.indexrelid) "
+            "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE i.indrelid = to_regclass(%s)",
+            [f'"{self.table_name}"'],
+        )
+        on_this_table = {
+            n: (valid, not unique and ddl) for n, valid, unique, ddl in cur.fetchall()
+        }
+        failed: list[str] = []
+        for suffix, legacy, ddl, definition in BASE_INDEXES:
+            name = base_index_name(self.table_name, suffix)
+            try:
+                self._complete_base_index(
+                    cur, on_this_table, name, legacy, ddl, definition
+                )
+            except Exception as e:
+                # Most likely a deadlock with another pod's CONCURRENTLY build on
+                # this table: the connection is in autocommit, so it is still
+                # usable, and the next index must not pay for this one. The cause
+                # goes into the warning: a deadlock, a timeout and a bug differ.
+                logger.debug(
+                    "base index %r on %r failed", name, self.table_name, exc_info=True
+                )
+                first_line = (str(e).strip().splitlines() or [""])[0]
+                failed.append(f"{name} ({type(e).__name__}: {first_line})")
+        if failed:
+            raise RuntimeError(
+                f"{len(failed)} base index(es) not built: {', '.join(failed)}"
+            )
+
+    def _complete_base_index(
+        self,
+        cur,
+        on_this_table: dict,
+        name: str,
+        legacy: str,
+        ddl: str,
+        definition: str,
+    ) -> None:
+        new = on_this_table.get(name)
+        old = on_this_table.get(legacy)
+        # The fixed name on THIS table, holding THIS index (not unique, same
+        # definition): SpecStar's own, not someone's index that shares the name.
+        ours = old is not None and bool(old[1]) and old[1].endswith(definition)
+        if new is not None and new[0]:
+            if ours:
+                # A second copy: built by the pre-build statements beside the fixed
+                # name, or put back by an old version's boot mid-rollout.
+                cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{legacy}"')
+            return
+        if new is not None:  # a build killed midway: invalid
+            cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+        if ours and old[0]:
+            # This table took the fixed name: the same index, under a name that no
+            # longer blocks every other table in the schema.
+            cur.execute(f'ALTER INDEX "{legacy}" RENAME TO "{name}"')
+            return
+        if ours:  # the fixed name, but invalid
+            cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{legacy}"')
+        cur.execute(
+            f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{name}" ON "{self.table_name}" {ddl}'
+        )
 
     def _migrate_existing_data(self, cur):
         """為已存在但沒有 indexed_data 的記錄填充索引數據"""
@@ -1702,7 +1904,7 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
         if condition.quantifier is not None:
             # ``.any().eq(v)`` is exactly element membership, so it is the same
             # question as a bare list ``.contains(v)`` — route it to the top-level
-            # ``indexed_data @> {"f": [v]}`` probe served by idx_indexed_data_gin
+            # ``indexed_data @> {"f": [v]}`` probe served by the indexed_data GIN
             # instead of a per-row EXISTS(jsonb_array_elements_text) scan. The
             # containment form matches the reference on every edge (a scalar /
             # missing / empty-array field all fail it, just like ``any`` does).
