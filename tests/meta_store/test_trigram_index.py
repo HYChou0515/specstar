@@ -25,6 +25,7 @@ from specstar.query_types import (
     DataSearchOperator,
     DataSearchQuantifier,
 )
+from specstar.resource_manager.meta_store.postgres import base_index_name
 from specstar.types import ResourceMeta
 
 from .common import get_meta_store
@@ -155,7 +156,7 @@ def test_any_eq_membership_uses_the_shared_jsonb_gin(store):
         store,
         'SELECT count(*) FROM {t} WHERE indexed_data @> \'{{"keys": ["mol"]}}\'',
     )
-    assert "idx_indexed_data_gin" in plan, plan
+    assert base_index_name(store.table_name, "indexed_data_gin") in plan, plan
 
 
 def test_any_eq_membership_matches_the_reference_answer(store):

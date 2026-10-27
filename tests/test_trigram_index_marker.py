@@ -115,7 +115,7 @@ def test_marker_is_exported_from_the_top_level_package():
 
 def test_any_eq_routes_to_the_top_level_containment_probe():
     """``.any().eq(v)`` is exact element membership, so it can go through the
-    shared ``idx_indexed_data_gin`` (``indexed_data @> {"f": [v]}``) instead of a
+    table's ``indexed_data`` GIN (``indexed_data @> {"f": [v]}``) instead of a
     per-row ``EXISTS(jsonb_array_elements_text …)`` scan."""
     sql, params = _builder(list_fields=["keys"])._build_condition(
         _quant(DataSearchOperator.equals, "mol", DataSearchQuantifier.any)
