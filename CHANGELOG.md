@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
+## [0.13.0a5] — 2026-10-27
+
+
+### Fixed
+
+- Give every table its own base meta indexes
+- Review r1 — drop the fixed-name copies, rename only SpecStar's own
+- Review r2 — one lost statement skips only its own index
+- Review r3 — the base-index warning names each failure's cause
+
 ## [0.13.0a4] — 2026-09-15
 
 
