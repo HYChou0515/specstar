@@ -1157,14 +1157,16 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
                 self._complete_base_index(
                     cur, on_this_table, name, legacy, ddl, definition
                 )
-            except Exception:
+            except Exception as e:
                 # Most likely a deadlock with another pod's CONCURRENTLY build on
                 # this table: the connection is in autocommit, so it is still
-                # usable, and the next index must not pay for this one.
+                # usable, and the next index must not pay for this one. The cause
+                # goes into the warning: a deadlock, a timeout and a bug differ.
                 logger.debug(
                     "base index %r on %r failed", name, self.table_name, exc_info=True
                 )
-                failed.append(name)
+                first_line = (str(e).strip().splitlines() or [""])[0]
+                failed.append(f"{name} ({type(e).__name__}: {first_line})")
         if failed:
             raise RuntimeError(
                 f"{len(failed)} base index(es) not built: {', '.join(failed)}"

@@ -405,7 +405,9 @@ def test_the_old_names_are_renamed_in_place_not_built_again(dsn):
     assert after == before
 
 
-def test_one_index_that_cannot_be_built_does_not_cost_the_others(dsn, monkeypatch):
+def test_one_index_that_cannot_be_built_does_not_cost_the_others(
+    dsn, monkeypatch, caplog
+):
     # Another pod's CREATE INDEX CONCURRENTLY on the same table (a SortIndex, a
     # TrigramIndex) can deadlock with ours and pick our statement as the victim.
     owner, other = _table(), _table()
@@ -453,7 +455,12 @@ def test_one_index_that_cannot_be_built_does_not_cost_the_others(dsn, monkeypatc
         return Conn(conn) if args and not kwargs else conn
 
     monkeypatch.setattr(psycopg2, "connect", connect)
-    PostgresMetaStore(pg_dsn=dsn, table_name=other)
+    with caplog.at_level(logging.WARNING):
+        PostgresMetaStore(pg_dsn=dsn, table_name=other)
+    # The warning names the index AND why: a deadlock, a timeout and a bug differ.
+    assert "is_deleted" in caplog.text and "DeadlockDetected" in caplog.text, (
+        caplog.text
+    )
     built = set(_base(dsn, other))
     # is_deleted is fifth of eleven: the six after it must not be skipped.
     assert built == EXPECTED - {("btree", "is_deleted")}
