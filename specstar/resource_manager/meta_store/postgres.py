@@ -120,30 +120,68 @@ _TRGM_COARSE_OPS = frozenset(
 logger = logging.getLogger(__name__)
 
 #: The base indexes every meta table carries: (name suffix, the fixed name
-#: 0.13.0a4 and earlier gave it, what follows ``ON "table"``).
+#: 0.13.0a4 and earlier gave it, what follows ``ON "table"``, how
+#: ``pg_get_indexdef`` ends for it).
 #:
-#: Their names used to be those fixed names. Postgres index names are unique per
-#: SCHEMA, not per table, and the DDL said ``IF NOT EXISTS`` — so in a schema
-#: holding several SpecStar tables the first table took every name and each later
-#: table got a NOTICE and no index: its ``==`` / ``in_`` probes, which only this
-#: GIN serves (#416), scanned every row. A name is now per table
-#: (:func:`base_index_name`).
-BASE_INDEXES: tuple[tuple[str, str, str], ...] = (
-    ("created_time", "idx_created_time", "(created_time)"),
-    ("updated_time", "idx_updated_time", "(updated_time)"),
-    ("created_by", "idx_created_by", "(created_by)"),
-    ("updated_by", "idx_updated_by", "(updated_by)"),
-    ("is_deleted", "idx_is_deleted", "(is_deleted)"),
-    ("rev_status", "idx_rev_status", "(rev_status)"),
-    ("rev_created_by", "idx_rev_created_by", "(rev_created_by)"),
-    ("rev_updated_by", "idx_rev_updated_by", "(rev_updated_by)"),
-    ("rev_created_time", "idx_rev_created_time", "(rev_created_time)"),
-    ("rev_updated_time", "idx_rev_updated_time", "(rev_updated_time)"),
-    ("indexed_data_gin", "idx_indexed_data_gin", "USING GIN (indexed_data)"),
+#: Their names used to be those fixed names. An index name shares its schema's
+#: relation namespace with every table, view and index in it, and the DDL said
+#: ``IF NOT EXISTS`` — so in a schema holding several SpecStar tables the first
+#: table took every name and each later table got a NOTICE and no index: its
+#: ``==`` / ``in_`` probes, which only this GIN serves (#416), scanned every row.
+#: A name is now per table (:func:`base_index_name`). The last element tells a
+#: fixed-name index SpecStar built from someone's own index that merely shares the
+#: name: only the former is renamed or dropped.
+BASE_INDEXES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "created_time",
+        "idx_created_time",
+        "(created_time)",
+        "USING btree (created_time)",
+    ),
+    (
+        "updated_time",
+        "idx_updated_time",
+        "(updated_time)",
+        "USING btree (updated_time)",
+    ),
+    ("created_by", "idx_created_by", "(created_by)", "USING btree (created_by)"),
+    ("updated_by", "idx_updated_by", "(updated_by)", "USING btree (updated_by)"),
+    ("is_deleted", "idx_is_deleted", "(is_deleted)", "USING btree (is_deleted)"),
+    ("rev_status", "idx_rev_status", "(rev_status)", "USING btree (rev_status)"),
+    (
+        "rev_created_by",
+        "idx_rev_created_by",
+        "(rev_created_by)",
+        "USING btree (rev_created_by)",
+    ),
+    (
+        "rev_updated_by",
+        "idx_rev_updated_by",
+        "(rev_updated_by)",
+        "USING btree (rev_updated_by)",
+    ),
+    (
+        "rev_created_time",
+        "idx_rev_created_time",
+        "(rev_created_time)",
+        "USING btree (rev_created_time)",
+    ),
+    (
+        "rev_updated_time",
+        "idx_rev_updated_time",
+        "(rev_updated_time)",
+        "USING btree (rev_updated_time)",
+    ),
+    (
+        "indexed_data_gin",
+        "idx_indexed_data_gin",
+        "USING GIN (indexed_data)",
+        "USING gin (indexed_data)",
+    ),
 )
 
-#: Postgres truncates a longer identifier SILENTLY, which would make two long
-#: table names sharing their first 63 bytes collide again.
+#: Postgres truncates a longer identifier with no more than a NOTICE, which would
+#: make two long table names sharing their first 63 bytes collide again.
 _PG_IDENTIFIER_BYTES = 63
 
 
@@ -180,7 +218,7 @@ def base_index_statements(table_name: str) -> list[str]:
     return [
         f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{base_index_name(table_name, suffix)}" '
         f'ON "{table_name}" {ddl}'
-        for suffix, _, ddl in BASE_INDEXES
+        for suffix, _, ddl, _ in BASE_INDEXES
     ]
 
 
@@ -1038,7 +1076,7 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
             if not existed:
                 # An empty table: building them here costs nothing, and a table
                 # created by this process has them before its first row.
-                for suffix, _, ddl in BASE_INDEXES:
+                for suffix, _, ddl, _ in BASE_INDEXES:
                     name = base_index_name(self.table_name, suffix)
                     cur.execute(
                         f'CREATE INDEX IF NOT EXISTS "{name}" ON "{self.table_name}" {ddl}'
@@ -1100,25 +1138,32 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
 
     def _complete_base_indexes(self, cur) -> None:
         cur.execute(
-            "SELECT c.relname, i.indisvalid FROM pg_index i "
-            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "SELECT c.relname, i.indisvalid, pg_get_indexdef(i.indexrelid) "
+            "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
             "WHERE i.indrelid = to_regclass(%s)",
             [f'"{self.table_name}"'],
         )
-        on_this_table = dict(cur.fetchall())  # name -> valid
-        for suffix, legacy, ddl in BASE_INDEXES:
+        on_this_table = {n: (valid, ddl) for n, valid, ddl in cur.fetchall()}
+        for suffix, legacy, ddl, definition in BASE_INDEXES:
             name = base_index_name(self.table_name, suffix)
-            valid = on_this_table.get(name)
-            if valid:
+            new = on_this_table.get(name)
+            old = on_this_table.get(legacy)
+            # The fixed name on THIS table, holding THIS index: SpecStar's own.
+            ours = old is not None and old[1].endswith(definition)
+            if new is not None and new[0]:
+                if ours:
+                    # A second copy: built by the pre-build statements beside the
+                    # fixed name, or put back by an old version's boot mid-rollout.
+                    cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{legacy}"')
                 continue
-            if valid is False:
+            if new is not None:  # a build killed midway: invalid
                 cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
-            elif on_this_table.get(legacy):
+            if ours and old[0]:
                 # This table took the fixed name: the same index, under a name
                 # that no longer blocks every other table in the schema.
                 cur.execute(f'ALTER INDEX "{legacy}" RENAME TO "{name}"')
                 continue
-            elif legacy in on_this_table:  # the fixed name, but invalid
+            if ours:  # the fixed name, but invalid
                 cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{legacy}"')
             cur.execute(
                 f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{name}" '
@@ -1651,7 +1696,6 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
                 # Postgres: ``LIMIT NULL`` = no limit (offset still applies).
                 sql += " LIMIT %s OFFSET %s"
                 params = [*params, limit, offset]
-
         # Same rule as `iter_search`, for the same reason. A GROUP BY is not
         # inherently small — grouping by a high-cardinality key returns a row per
         # group, which can be a row per resource — so what bounds it is the

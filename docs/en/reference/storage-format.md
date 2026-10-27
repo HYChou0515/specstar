@@ -106,24 +106,29 @@ CREATE INDEX "idx_{table_name}_indexed_data_gin" ON "{table_name}" USING GIN (in
 Each name carries its table (`base_index_name`; past Postgres's 63 bytes the
 table part is cut and a digest of the full name keeps it distinct). Up to
 0.13.0a4 the names were fixed (`idx_indexed_data_gin`, `idx_is_deleted`, …) —
-and Postgres index names are unique per **schema**, so in a schema with several
-tables only the first got them: every other table's `==` / `in_` filters scanned
-every row. On boot an existing table now gets what it lacks: the first table's
-fixed-name indexes are renamed, the others' are built with
-`CREATE INDEX CONCURRENTLY` (the table keeps taking writes; a failure is logged,
-never raised). On a large table that build is long and runs on the boot path, so
-build them before upgrading — one statement at a time, as the table's owner:
+and an index name shares its schema's relation namespace with every table and
+index in it, so in a schema with several tables only the first got them: every
+other table's `==` / `in_` filters scanned every row. On boot an existing table
+now gets what it lacks: the first table's fixed-name indexes are renamed, the
+others' are built with `CREATE INDEX CONCURRENTLY` (the table keeps taking
+writes; a failed build is logged, never raised). On a large table that build is
+long and runs on the boot path, so build them before upgrading — one statement at
+a time, as the table's owner:
 
 ```python
+import psycopg2
 from specstar.resource_manager.meta_store.postgres import base_index_statements
 
-for sql in base_index_statements("my_table_meta"):
-    cursor.execute(sql)  # autocommit: CONCURRENTLY refuses a transaction
+conn = psycopg2.connect(dsn)
+conn.autocommit = True  # CONCURRENTLY refuses a transaction
+with conn.cursor() as cur:
+    for sql in base_index_statements("my_table_meta"):
+        cur.execute(sql)
 ```
 
-The upgraded boot then finds every index and builds nothing. A build killed
-midway leaves an INVALID index under its name, which the boot drops and builds
-again.
+The upgraded boot then builds nothing; on the first table it drops the
+fixed-name copies the statements were built beside. A build killed midway leaves
+an INVALID index under its name, which the boot drops and builds again.
 
 `table_name` defaults to `resource_meta` and is customisable per
 manager. **`data` is the source of truth**: if you read `data` and

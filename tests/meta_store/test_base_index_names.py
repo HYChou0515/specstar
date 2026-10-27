@@ -4,8 +4,9 @@
 GIN that every ``==`` / ``in_`` / list ``.contains`` probe relies on (#416), the
 ``is_deleted`` btree every listing filters on, and the ``created_*`` /
 ``updated_*`` / ``rev_*`` btrees — under FIXED names (``idx_indexed_data_gin``,
-``idx_is_deleted``, ...). Postgres index names are unique per SCHEMA, not per
-table, and the DDL said ``IF NOT EXISTS``: so in a schema holding several
+``idx_is_deleted``, ...). An index name shares its schema's relation namespace
+with every table and index in it, and the DDL said ``IF NOT EXISTS``: so in a
+schema holding several
 SpecStar tables the first table took every name and each later table got a
 ``NOTICE: relation "idx_indexed_data_gin" already exists, skipping`` and no
 index at all. Its equality filters scanned every row.
@@ -296,8 +297,13 @@ def test_a_build_that_fails_does_not_fail_the_boot(dsn, monkeypatch, caplog):
 
 
 def test_long_table_names_sharing_a_prefix_get_distinct_index_names(dsn):
-    stem = "a_table_name_long_enough_to_push_any_index_name_past_63_bytes_"
-    tables = [stem + uuid.uuid4().hex[:6] for _ in range(2)]
+    # Each table name fits Postgres's 63 bytes (so they are two tables), but
+    # ``idx_{table}_indexed_data_gin`` does not, and a plain cut at 63 bytes would
+    # give both the same index names: they differ only after the cut.
+    stem = "a_table_name_long_enough_to_push_index_names_"
+    tables = [stem + uuid.uuid4().hex[:8] for _ in range(2)]
+    assert all(len(t) <= 63 for t in tables)
+    assert all(len(f"idx_{t}_is_deleted") > 63 for t in tables)
     for t in tables:
         PostgresMetaStore(pg_dsn=dsn, table_name=t)
     names = [n for t in tables for n, _, d in _indexes(dsn, t) if d in EXPECTED]
@@ -334,3 +340,66 @@ def test_an_invalid_index_under_the_old_name_is_replaced_not_renamed(dsn):
     PostgresMetaStore(pg_dsn=dsn, table_name=owner)
     gins = [(n, v) for n, v, d in _indexes(dsn, owner) if d == ("gin", "indexed_data")]
     assert gins == [(base_index_name(owner, "indexed_data_gin"), True)]
+
+
+def _legacy_names(dsn: str, table: str) -> set[str]:
+    legacy = {old for _, old, *_ in BASE_INDEXES}
+    return {n for n, _, _ in _indexes(dsn, table)} & legacy
+
+
+def test_prebuilding_the_table_that_holds_the_old_names_leaves_one_of_each(dsn):
+    # The pre-build statements cannot rename: on the table holding the old names
+    # they build a second copy of every index. The boot must drop the old copies.
+    owner, other = _table(), _table()
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)
+    PostgresMetaStore(pg_dsn=dsn, table_name=other)
+    _as_built_by_0_13_0a4(dsn, owner, [other])
+    for statement in base_index_statements(owner):
+        _sql(dsn, statement)
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)
+    assert _base(dsn, owner) == sorted(EXPECTED)
+    assert _legacy_names(dsn, owner) == set()
+
+
+def test_old_names_an_old_version_puts_back_mid_rollout_are_dropped(dsn):
+    # Once renamed, the old names are free again: an old pod restarting during the
+    # rollout (or a rollback) builds all eleven again on the first table it opens.
+    owner, other = _table(), _table()
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)
+    PostgresMetaStore(pg_dsn=dsn, table_name=other)
+    _as_built_by_0_13_0a4(dsn, owner, [])  # `other` already has its new names
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)  # a new pod: renamed
+    _as_built_by_0_13_0a4(dsn, other, [])  # an old pod: the old names, on `other`
+    for _, old, ddl, _ in BASE_INDEXES:  # ...as a second copy beside the new ones
+        _sql(dsn, f'CREATE INDEX IF NOT EXISTS "{old}" ON "{owner}" {ddl}')
+    for t in (owner, other):
+        PostgresMetaStore(pg_dsn=dsn, table_name=t)  # the next new boot
+        assert _base(dsn, t) == sorted(EXPECTED), t
+        assert _legacy_names(dsn, t) == set(), t
+
+
+def test_an_index_of_ours_by_name_only_is_neither_renamed_nor_dropped(dsn):
+    # Someone's own index that happens to be called idx_created_time, on another
+    # column: not SpecStar's, so it stays, and the real one is built beside it.
+    t = _table()
+    PostgresMetaStore(pg_dsn=dsn, table_name=t)
+    _as_built_by_0_13_0a4(dsn, t, [])
+    _sql(dsn, 'DROP INDEX "idx_created_time"')
+    _sql(dsn, f'CREATE INDEX "idx_created_time" ON "{t}" (updated_by)')
+    PostgresMetaStore(pg_dsn=dsn, table_name=t)
+    mine = [d for n, _, d in _indexes(dsn, t) if n == "idx_created_time"]
+    assert mine == [("btree", "updated_by")]
+    assert ("btree", "created_time") in _base(dsn, t)
+
+
+def test_the_old_names_are_renamed_in_place_not_built_again(dsn):
+    # A rename is a catalog change; a rebuild of the GIN on a large table is not.
+    owner, other = _table(), _table()
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)
+    PostgresMetaStore(pg_dsn=dsn, table_name=other)
+    _as_built_by_0_13_0a4(dsn, owner, [other])
+    oid = "SELECT to_regclass(%s)::oid"
+    before = _sql(dsn, oid, ["idx_indexed_data_gin"])[0][0]
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)
+    after = _sql(dsn, oid, [f'"{base_index_name(owner, "indexed_data_gin")}"'])[0][0]
+    assert after == before

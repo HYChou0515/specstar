@@ -1,6 +1,6 @@
 """``base_index_name``: per table, distinct, and within Postgres's 63-byte limit.
 
-Postgres silently TRUNCATES an identifier longer than 63 bytes, so two long table
+Postgres TRUNCATES an identifier longer than 63 bytes with only a NOTICE, so two long table
 names sharing their first 63 bytes would collide again — the very bug the
 per-table names fix. Pure function; no database (named to stay out of the
 integration glob, so CI runs it).
