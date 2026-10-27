@@ -285,8 +285,8 @@ the boot finds them and builds nothing.
 
 Finish the rollout before relying on it: an old-version process that boots after
 an upgraded one (a crash restart, a rollback) builds the fixed-name indexes again,
-non-concurrently, on the first table it opens — blocking that table's writes while
-it builds. The next upgraded boot drops those copies.
+non-concurrently, on the first table it opens — blocking that table's writes until
+its startup transaction commits. The next upgraded boot drops those copies.
 
 ## Configuration
 

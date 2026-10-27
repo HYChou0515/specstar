@@ -403,3 +403,95 @@ def test_the_old_names_are_renamed_in_place_not_built_again(dsn):
     PostgresMetaStore(pg_dsn=dsn, table_name=owner)
     after = _sql(dsn, oid, [f'"{base_index_name(owner, "indexed_data_gin")}"'])[0][0]
     assert after == before
+
+
+def test_one_index_that_cannot_be_built_does_not_cost_the_others(dsn, monkeypatch):
+    # Another pod's CREATE INDEX CONCURRENTLY on the same table (a SortIndex, a
+    # TrigramIndex) can deadlock with ours and pick our statement as the victim.
+    owner, other = _table(), _table()
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)
+    PostgresMetaStore(pg_dsn=dsn, table_name=other)
+    _as_built_by_0_13_0a4(dsn, owner, [other])
+    real_connect = psycopg2.connect
+
+    class Failing:
+        def __init__(self, cur):
+            self._cur = cur
+
+        def execute(self, sql, *args):
+            if "_is_deleted" in str(sql) and "CREATE INDEX" in str(sql):
+                raise psycopg2.errors.DeadlockDetected("deadlock detected")
+            return self._cur.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._cur, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._cur.__exit__(*exc)
+
+    class Conn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def cursor(self, *a, **k):
+            return Failing(self._conn.cursor(*a, **k).__enter__())
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __setattr__(self, name, value):
+            if name == "_conn":
+                object.__setattr__(self, name, value)
+            else:
+                setattr(self._conn, name, value)
+
+    def connect(*args, **kwargs):  # only the build's own connection (see above)
+        conn = real_connect(*args, **kwargs)
+        return Conn(conn) if args and not kwargs else conn
+
+    monkeypatch.setattr(psycopg2, "connect", connect)
+    PostgresMetaStore(pg_dsn=dsn, table_name=other)
+    built = set(_base(dsn, other))
+    # is_deleted is fifth of eleven: the six after it must not be skipped.
+    assert built == EXPECTED - {("btree", "is_deleted")}
+    monkeypatch.undo()
+    PostgresMetaStore(pg_dsn=dsn, table_name=other)  # the next boot finishes it
+    assert _base(dsn, other) == sorted(EXPECTED)
+
+
+def test_a_unique_index_under_an_old_name_is_not_ours(dsn):
+    t = _table()
+    PostgresMetaStore(pg_dsn=dsn, table_name=t)
+    _as_built_by_0_13_0a4(dsn, t, [])
+    _sql(dsn, 'DROP INDEX "idx_created_time"')
+    _sql(dsn, f'CREATE UNIQUE INDEX "idx_created_time" ON "{t}" (created_time)')
+    PostgresMetaStore(pg_dsn=dsn, table_name=t)
+    unique = _sql(
+        dsn,
+        "SELECT i.indisunique FROM pg_index i WHERE i.indexrelid = to_regclass(%s)",
+        ["idx_created_time"],
+    )
+    assert unique == [(True,)]  # still there, still unique
+    assert ("btree", "created_time") in _base(dsn, t)
+
+
+def test_an_invalid_new_name_beside_a_valid_old_one_is_replaced_by_a_rename(dsn):
+    owner, other = _table(), _table()
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)
+    PostgresMetaStore(pg_dsn=dsn, table_name=other)
+    _as_built_by_0_13_0a4(dsn, owner, [other])
+    gin = base_index_name(owner, "indexed_data_gin")
+    _sql(dsn, f'CREATE INDEX "{gin}" ON "{owner}" USING GIN (indexed_data)')
+    _sql(
+        dsn,
+        "UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass(%s)",
+        [f'"{gin}"'],
+    )
+    before = _sql(dsn, "SELECT to_regclass(%s)::oid", ["idx_indexed_data_gin"])[0][0]
+    PostgresMetaStore(pg_dsn=dsn, table_name=owner)
+    gins = [(n, v) for n, v, d in _indexes(dsn, owner) if d == ("gin", "indexed_data")]
+    assert gins == [(gin, True)]
+    assert _sql(dsn, "SELECT to_regclass(%s)::oid", [f'"{gin}"'])[0][0] == before

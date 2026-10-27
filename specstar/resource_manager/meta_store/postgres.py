@@ -1094,11 +1094,14 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
         first table in its schema) or has no base index at all (every other one).
         The first are RENAMED — instant, and no second copy of each index; the
         rest are built ``CONCURRENTLY``, so the table keeps taking writes. Like
-        :meth:`_build_sort_index_ddl`: an advisory lock elects one builder among
-        pods booting together (concurrent builds on one table deadlock), and no
-        failure leaves this method — a missing index costs speed, never
-        correctness, so it must never cost a boot. A build killed midway leaves an
-        INVALID index under the new name; it is dropped and built again.
+        :meth:`_build_sort_index_ddl`: an advisory lock elects one builder of THESE
+        indexes among pods booting together, and no failure leaves this method — a
+        missing index costs speed, never correctness, so it must never cost a boot.
+        The lock does not cover another pod's sort / set / trigram build on the same
+        table, which can still deadlock with ours and kill one statement: each
+        index is therefore tried on its own, so one lost statement skips only its
+        own index until the next boot. A build killed midway leaves an INVALID
+        index under the new name; it is dropped and built again.
         """
         try:
             self._try_ensure_base_indexes()
@@ -1138,37 +1141,67 @@ class PostgresMetaStore(IMetaWithAgg, IMetaWithCount, ISlowMetaStore):
 
     def _complete_base_indexes(self, cur) -> None:
         cur.execute(
-            "SELECT c.relname, i.indisvalid, pg_get_indexdef(i.indexrelid) "
+            "SELECT c.relname, i.indisvalid, i.indisunique, "
+            "pg_get_indexdef(i.indexrelid) "
             "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
             "WHERE i.indrelid = to_regclass(%s)",
             [f'"{self.table_name}"'],
         )
-        on_this_table = {n: (valid, ddl) for n, valid, ddl in cur.fetchall()}
+        on_this_table = {
+            n: (valid, not unique and ddl) for n, valid, unique, ddl in cur.fetchall()
+        }
+        failed: list[str] = []
         for suffix, legacy, ddl, definition in BASE_INDEXES:
             name = base_index_name(self.table_name, suffix)
-            new = on_this_table.get(name)
-            old = on_this_table.get(legacy)
-            # The fixed name on THIS table, holding THIS index: SpecStar's own.
-            ours = old is not None and old[1].endswith(definition)
-            if new is not None and new[0]:
-                if ours:
-                    # A second copy: built by the pre-build statements beside the
-                    # fixed name, or put back by an old version's boot mid-rollout.
-                    cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{legacy}"')
-                continue
-            if new is not None:  # a build killed midway: invalid
-                cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
-            if ours and old[0]:
-                # This table took the fixed name: the same index, under a name
-                # that no longer blocks every other table in the schema.
-                cur.execute(f'ALTER INDEX "{legacy}" RENAME TO "{name}"')
-                continue
-            if ours:  # the fixed name, but invalid
-                cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{legacy}"')
-            cur.execute(
-                f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{name}" '
-                f'ON "{self.table_name}" {ddl}'
+            try:
+                self._complete_base_index(
+                    cur, on_this_table, name, legacy, ddl, definition
+                )
+            except Exception:
+                # Most likely a deadlock with another pod's CONCURRENTLY build on
+                # this table: the connection is in autocommit, so it is still
+                # usable, and the next index must not pay for this one.
+                logger.debug(
+                    "base index %r on %r failed", name, self.table_name, exc_info=True
+                )
+                failed.append(name)
+        if failed:
+            raise RuntimeError(
+                f"{len(failed)} base index(es) not built: {', '.join(failed)}"
             )
+
+    def _complete_base_index(
+        self,
+        cur,
+        on_this_table: dict,
+        name: str,
+        legacy: str,
+        ddl: str,
+        definition: str,
+    ) -> None:
+        new = on_this_table.get(name)
+        old = on_this_table.get(legacy)
+        # The fixed name on THIS table, holding THIS index (not unique, same
+        # definition): SpecStar's own, not someone's index that shares the name.
+        ours = old is not None and bool(old[1]) and old[1].endswith(definition)
+        if new is not None and new[0]:
+            if ours:
+                # A second copy: built by the pre-build statements beside the fixed
+                # name, or put back by an old version's boot mid-rollout.
+                cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{legacy}"')
+            return
+        if new is not None:  # a build killed midway: invalid
+            cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+        if ours and old[0]:
+            # This table took the fixed name: the same index, under a name that no
+            # longer blocks every other table in the schema.
+            cur.execute(f'ALTER INDEX "{legacy}" RENAME TO "{name}"')
+            return
+        if ours:  # the fixed name, but invalid
+            cur.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{legacy}"')
+        cur.execute(
+            f'CREATE INDEX CONCURRENTLY IF NOT EXISTS "{name}" ON "{self.table_name}" {ddl}'
+        )
 
     def _migrate_existing_data(self, cur):
         """為已存在但沒有 indexed_data 的記錄填充索引數據"""

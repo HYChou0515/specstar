@@ -126,8 +126,8 @@ with conn.cursor() as cur:
         cur.execute(sql)
 ```
 
-The upgraded boot then builds nothing; on the first table it drops the
-fixed-name copies the statements were built beside. A build killed midway leaves
+The upgraded boot then builds nothing; on the table that held the fixed names it
+drops the fixed-name copies the statements were built beside. A build killed midway leaves
 an INVALID index under its name, which the boot drops and builds again.
 
 `table_name` defaults to `resource_meta` and is customisable per
